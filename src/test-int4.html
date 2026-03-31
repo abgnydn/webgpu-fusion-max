@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>INT4 Quantized Fused Transformer</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>INT4 Quantized Fused Transformer — Phi-3-mini Scale</h2>
+<p>Weights quantized to 4-bit with group-wise f16 scales. 7x less memory.</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+// INT4 quantization: pack 8 weights into 1 u32 (4 bits each)
+// Each group of 32 weights has one f32 scale and one f32 zero-point
+// Dequantize: weight = (int4_val - 8) * scale
+//
+// For the GPU shader, we store:
+//   - Packed weights: array<u32> where each u32 holds 8 int4 values
+//   - Scales: array<f32> one per group of 32 weights
+//   - LN params: array<f32> (kept in full precision)
+
+const GROUP_SIZE = 32;
+
+const tests = [
+  { D: 896,  NH: 14, NL: 1,  label: 'Qwen2 1L (int4)' },
+  { D: 896,  NH: 14, NL: 24, label: 'Qwen2-0.5B full (int4)' },
+  { D: 3072, NH: 32, NL: 1,  label: 'Phi-3-mini 1L (int4)' },
+  { D: 3072, NH: 32, NL: 8,  label: 'Phi-3-mini 8L (int4)' },
+  { D: 3072, NH: 32, NL: 32, label: 'Phi-3-mini FULL 32L (int4)' },
+];
+
+function computeLayout(D, DF, NL) {
+  // Per layer: projection weights are quantized, LN/bias are f32
+  // Projection matrices: Wq(D*D) + Wk(D*D) + Wv(D*D) + Wo(D*D) + W1(D*DF) + W2(DF*D)
+  const projParams = 4*D*D + 2*D*DF;
+  const nGroups = projParams / GROUP_SIZE;
+  const packedU32s = projParams / 8; // 8 int4 values per u32
+
+  // LN + bias params: ln1_g(D) + ln1_b(D) + ln2_g(D) + ln2_b(D) + b1(DF) + b2(D)
+  const lnParams = 4*D + DF + D;
+
+  return {
+    projParams,
+    nGroups,
+    packedU32s,           // u32 count for packed weights
+    scaleFloats: nGroups, // f32 count for scales
+    lnFloats: lnParams,   // f32 count for LN/bias
+    // Buffer sizes per layer (bytes)
+    packedBytes: packedU32s * 4,
+    scaleBytes: nGroups * 4,
+    lnBytes: lnParams * 4,
+    totalBytesPerLayer: packedU32s * 4 + nGroups * 4 + lnParams * 4,
+  };
+}
+
+function generateInt4Shader(D, NH, NL, layout) {
+  const HD = D / NH;
+  const DF = D * 4;
+  const SL = 16;
+  const WG = 64;
+  const TILE = 256;
+  const { packedU32s, scaleFloats, lnFloats } = layout;
+
+  // Per-layer offsets into the packed buffer
+  // Layout per layer in the packed buffer:
+  //   packed_weights: [0 .. packedU32s)
+  //   scales:         [packedU32s .. packedU32s + scaleFloats)  (as u32 reinterpreted as f32)
+  //   ln_params:      [packedU32s + scaleFloats .. packedU32s + scaleFloats + lnFloats) (as u32/f32)
+  const layerU32s = packedU32s + scaleFloats + lnFloats;
+
+  // Projection matrix order within packed weights:
+  // Wq(D*D), Wk(D*D), Wv(D*D), Wo(D*D), W1(D*DF), W2(DF*D)
+  const wqOff = 0;
+  const wkOff = D*D;
+  const wvOff = 2*D*D;
+  const woOff = 3*D*D;
+  const w1Off = 4*D*D;
+  const w2Off = 4*D*D + D*DF;
+
+  // LN param offsets (within LN section)
+  const lg1 = 0, lb1 = D, lg2 = 2*D, lb2 = 3*D, b1 = 4*D, b2 = 4*D + DF;
+
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const SL:u32=${SL}u;const NL:u32=${NL}u;const EPS:f32=1e-5;
+const WG:u32=${WG}u;const TILE:u32=${TILE}u;const SC:u32=${SL*D}u;
+const GS:u32=${GROUP_SIZE}u;
+const LU:u32=${layerU32s}u;
+const PU:u32=${packedU32s}u;
+const SU:u32=${scaleFloats}u;
+
+@group(0)@binding(0) var<storage,read> packed:array<u32>;  // quantized weights + scales + LN
+@group(0)@binding(1) var<storage,read_write> io:array<f32>;
+@group(0)@binding(2) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(3) var<uniform> u:vec4<u32>;
+
+var<workgroup> sx:array<f32,${D}>;
+var<workgroup> sr:array<f32,${WG}>;
+var<workgroup> ft:array<f32,${TILE}>;
+
+fn gelu(x:f32)->f32{let c=clamp(x,-20.0,20.0);let i=0.7978845608*(c+0.044715*c*c*c);return 0.5*c*(1.0+tanh(i));}
+
+// Dequantize: extract 4-bit value from packed u32 and multiply by scale
+fn dequant(layer_base:u32, param_idx:u32)->f32{
+  let packed_base = layer_base;  // packed weights start at layer base
+  let scale_base = layer_base + PU;  // scales after packed weights
+
+  // Which u32 and which 4-bit slot
+  let u32_idx = param_idx / 8u;
+  let bit_offset = (param_idx % 8u) * 4u;
+  let val = (packed[packed_base + u32_idx] >> bit_offset) & 0xFu;
+
+  // Which group for the scale
+  let group_idx = param_idx / GS;
+  let scale = bitcast<f32>(packed[scale_base + group_idx]);
+
+  // Dequantize: (val - 8) * scale  (symmetric around 8)
+  return (f32(val) - 8.0) * scale;
+}
+
+// Read LN/bias param (stored as f32)
+fn ln_param(layer_base:u32, idx:u32)->f32{
+  return bitcast<f32>(packed[layer_base + PU + SU + idx]);
+}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.x;
+  let nt=u.x;
+
+  for(var t=0u;t<nt;t++){
+    let tb=t*D;
+    for(var i=tid;i<D;i+=WG){sx[i]=io[tb+i];}
+    workgroupBarrier();
+
+    for(var layer=0u;layer<NL;layer++){
+      let LB=layer*LU;
+      let kvB=layer*SL*D;
+
+      // LN1
+      var ps:f32=0.0;
+      for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+      sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu=sr[0]/f32(D);workgroupBarrier();
+      var pv2:f32=0.0;
+      for(var i=tid;i<D;i+=WG){let d=sx[i]-mu;pv2+=d*d;}
+      sr[tid]=pv2;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is1=min(1.0/sqrt(sr[0]/f32(D)+EPS),1e4);workgroupBarrier();
+      for(var i=tid;i<D;i+=WG){
+        io[SC+i]=(sx[i]-mu)*is1*ln_param(LB,${lg1}u+i)+ln_param(LB,${lb1}u+i);
+      }workgroupBarrier();
+
+      // QKV (dequantized int4 matmul)
+      for(var i=tid;i<D;i+=WG){
+        var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+        for(var j=0u;j<D;j++){
+          let l=io[SC+j];
+          qa+=l*dequant(LB,${wqOff}u+j*D+i);
+          ka+=l*dequant(LB,${wkOff}u+j*D+i);
+          va+=l*dequant(LB,${wvOff}u+j*D+i);
+        }
+        io[tb+i]=qa;
+        kv[kvB+t*D+i]=ka;
+        kv[NL*SL*D+kvB+t*D+i]=va;
+      }workgroupBarrier();
+
+      // Attention
+      for(var i=tid;i<D;i+=WG){io[SC+i]=0.0;}
+      workgroupBarrier();
+      for(var h=tid;h<NH;h+=WG){
+        let ho=h*HD;
+        var mx:f32=-1e9;
+        for(var s=0u;s<=t;s++){
+          var sc:f32=0.0;
+          for(var d=0u;d<HD;d++){sc+=io[tb+ho+d]*kv[kvB+s*D+ho+d];}
+          sc/=sqrt(f32(HD));if(sc>mx){mx=sc;}
+        }
+        var es:f32=0.0;
+        var ho2:array<f32,${HD}>;
+        for(var d=0u;d<HD;d++){ho2[d]=0.0;}
+        for(var s=0u;s<=t;s++){
+          var sc:f32=0.0;
+          for(var d=0u;d<HD;d++){sc+=io[tb+ho+d]*kv[kvB+s*D+ho+d];}
+          let w=exp(sc/sqrt(f32(HD))-mx);es+=w;
+          for(var d=0u;d<HD;d++){ho2[d]+=w*kv[NL*SL*D+kvB+s*D+ho+d];}
+        }
+        if(es>0.0){for(var d=0u;d<HD;d++){io[SC+ho+d]=ho2[d]/es;}}
+      }workgroupBarrier();
+
+      // Wo + residual
+      for(var i=tid;i<D;i+=WG){
+        var a:f32=0.0;
+        for(var j=0u;j<D;j++){a+=io[SC+j]*dequant(LB,${woOff}u+j*D+i);}
+        sx[i]=sx[i]+a;
+      }workgroupBarrier();
+
+      // LN2
+      ps=0.0;
+      for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+      sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu2=sr[0]/f32(D);workgroupBarrier();
+      pv2=0.0;
+      for(var i=tid;i<D;i+=WG){let d=sx[i]-mu2;pv2+=d*d;}
+      sr[tid]=pv2;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is2=min(1.0/sqrt(sr[0]/f32(D)+EPS),1e4);workgroupBarrier();
+      for(var i=tid;i<D;i+=WG){
+        io[tb+i]=(sx[i]-mu2)*is2*ln_param(LB,${lg2}u+i)+ln_param(LB,${lb2}u+i);
+      }workgroupBarrier();
+
+      // Tiled FFN (int4 dequantized)
+      for(var i=tid;i<D;i+=WG){io[SC+i]=0.0;}
+      workgroupBarrier();
+      for(var tile=0u;tile<DF;tile+=TILE){
+        for(var i=tid;i<TILE;i+=WG){
+          let gi=tile+i;
+          if(gi<DF){
+            var a=ln_param(LB,${b1}u+gi);
+            for(var j=0u;j<D;j++){a+=io[tb+j]*dequant(LB,${w1Off}u+j*DF+gi);}
+            ft[i]=gelu(a);
+          } else {ft[i]=0.0;}
+        }workgroupBarrier();
+        for(var i=tid;i<D;i+=WG){
+          var a:f32=0.0;
+          for(var j=0u;j<TILE;j++){
+            let gj=tile+j;
+            if(gj<DF){a+=ft[j]*dequant(LB,${w2Off}u+gj*D+i);}
+          }
+          io[SC+i]+=a;
+        }workgroupBarrier();
+      }
+      for(var i=tid;i<D;i+=WG){sx[i]=sx[i]+io[SC+i]+ln_param(LB,${b2}u+i);}
+      workgroupBarrier();
+    }
+
+    for(var i=tid;i<D;i+=WG){io[tb+i]=sx[i];}
+    workgroupBarrier();
+  }
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Max buffer: ${(adapter.limits.maxStorageBufferBindingSize/1024/1024).toFixed(0)} MB\n`);
+
+  for (const test of tests) {
+    const { D, NH, NL, label } = test;
+    const DF = D * 4;
+    const SL = 16;
+    const layout = computeLayout(D, DF, NL);
+
+    const totalBytes = layout.totalBytesPerLayer * NL;
+    const kvBytes = NL * SL * D * 2 * 4;
+    const ioBytes = (SL * D + D) * 4;
+
+    L(`--- ${label} ---`);
+    L(`  Weights: ${(totalBytes/1024/1024).toFixed(0)} MB (int4+scales+LN)`);
+    L(`  KV cache: ${(kvBytes/1024/1024).toFixed(0)} MB`);
+
+    if (totalBytes > adapter.limits.maxStorageBufferBindingSize) {
+      L(`  SKIP: exceeds buffer limit\n`);
+      continue;
+    }
+
+    // Generate shader
+    L(`  Compiling...`);
+    const code = generateInt4Shader(D, NH, NL, layout);
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errors = info.messages.filter(m => m.type === 'error');
+    if (errors.length > 0) {
+      L(`  SHADER ERROR: ${errors[0].message}\n`);
+      continue;
+    }
+    const pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+    L(`  Compiled OK`);
+
+    // Allocate buffers
+    const layerU32s = layout.packedU32s + layout.scaleFloats + layout.lnFloats;
+    const totalU32s = layerU32s * NL;
+
+    const packedBuf = device.createBuffer({ size: totalU32s * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const ioBuf = device.createBuffer({ size: ioBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: kvBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // Upload quantized weights layer by layer (avoids huge JS allocation)
+    L(`  Uploading weights...`);
+    for (let l = 0; l < NL; l++) {
+      const base = l * layerU32s;
+
+      // Packed int4 weights: random 4-bit values packed into u32
+      const CHUNK = 1024 * 1024; // 1M u32s at a time
+      for (let off = 0; off < layout.packedU32s; off += CHUNK) {
+        const end = Math.min(off + CHUNK, layout.packedU32s);
+        const slice = new Uint32Array(end - off);
+        for (let i = 0; i < slice.length; i++) {
+          // Pack 8 random 4-bit values (0-15) into one u32
+          let v = 0;
+          for (let b = 0; b < 8; b++) v |= (Math.floor(Math.random() * 16) << (b * 4));
+          slice[i] = v;
+        }
+        device.queue.writeBuffer(packedBuf, (base + off) * 4, slice);
+      }
+
+      // Scales: random small floats
+      const scales = new Float32Array(layout.scaleFloats);
+      // Xavier scale: weights should have std ≈ 1/sqrt(fan_in)
+      // int4 values: (0..15)-8 gives std ≈ 4.6
+      // So scale = xavier / int4_std = (1/sqrt(D)) / 4.6
+      const int4Std = 4.6;
+      const xavierScale = 1.0 / (Math.sqrt(D) * int4Std);
+      for (let i = 0; i < scales.length; i++) scales[i] = xavierScale * (Math.random() * 0.3 + 0.85);
+      device.queue.writeBuffer(packedBuf, (base + layout.packedU32s) * 4, new Uint32Array(scales.buffer));
+
+      // LN params
+      const lnData = new Float32Array(layout.lnFloats);
+      // gammas = 1, betas = 0, biases = 0
+      for (let i = 0; i < D; i++) { lnData[i] = 1.0; }             // ln1_gamma
+      for (let i = D; i < 2*D; i++) { lnData[i] = 0.0; }           // ln1_beta
+      for (let i = 2*D; i < 3*D; i++) { lnData[i] = 1.0; }         // ln2_gamma
+      for (let i = 3*D; i < 4*D; i++) { lnData[i] = 0.0; }         // ln2_beta
+      // b1 and b2 stay 0 (from Float32Array init)
+      device.queue.writeBuffer(packedBuf, (base + layout.packedU32s + layout.scaleFloats) * 4, new Uint32Array(lnData.buffer));
+
+      if (l % 8 === 0 || l === NL - 1) L(`  Layer ${l+1}/${NL}`);
+    }
+
+    // Embeddings
+    const emb = new Float32Array(SL * D);
+    for (let i = 0; i < emb.length; i++) emb[i] = (Math.random() - 0.5) * 0.1;
+    device.queue.writeBuffer(ioBuf, 0, emb);
+    device.queue.writeBuffer(uBuf, 0, new Uint32Array([SL, 0, 0, 0]));
+
+    const bg = device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: packedBuf } },
+        { binding: 1, resource: { buffer: ioBuf } },
+        { binding: 2, resource: { buffer: kvBuf } },
+        { binding: 3, resource: { buffer: uBuf } },
+      ]
+    });
+
+    // Run + validate
+    L(`  Running...`);
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    const readBuf = device.createBuffer({ size: D * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    enc.copyBufferToBuffer(ioBuf, 0, readBuf, 0, D * 4);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+
+    if (check.every(v => v === 0)) { L(`  FAIL: all zeros\n`); continue; }
+    if (check.some(v => isNaN(v))) { L(`  FAIL: NaN\n`); continue; }
+    L(`  OUTPUT OK! [${check[0].toFixed(4)}, ${check[1].toFixed(4)}, ${check[2].toFixed(4)}]`);
+
+    // Benchmark
+    for (let i = 0; i < 2; i++) {
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass();
+      p.setPipeline(pipe); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1); p.end();
+      device.queue.submit([e.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+    const times = [];
+    for (let i = 0; i < 3; i++) {
+      const t0 = performance.now();
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass();
+      p.setPipeline(pipe); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1); p.end();
+      device.queue.submit([e.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      times.push(performance.now() - t0);
+    }
+    const mean = times.reduce((a,b)=>a+b)/times.length;
+    L(`  ${mean.toFixed(0)} ms | ${(SL/mean*1000).toFixed(1)} tok/s | 1 dispatch\n`);
+
+    packedBuf.destroy(); ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy(); readBuf.destroy();
+  }
+  L('Done.');
+}
+
+run().catch(e => L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>

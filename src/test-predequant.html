@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Pre-Dequant Phi-3-mini</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>Pre-Dequantize + f16 Matmul — Phi-3-mini</h2>
+<p>Dequant int4→f16 once per layer, then matmul on raw f16. No per-element bit shifting during compute.</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+const D = 3072, NH = 32, HD = D/NH, DF = D*4, WG = 256, TILE = 256, GS = 32;
+
+// Per layer weight counts
+const projParams = 4*D*D + 2*D*DF;  // QKV+O + FFN up/down
+const packedU32s = projParams / 8;
+const nGroups = projParams / GS;
+const lnParams = 4*D + DF + D;
+
+// Offsets into dequantized f32 buffer (per layer)
+const wqOff = 0, wkOff = D*D, wvOff = 2*D*D, woOff = 3*D*D;
+const w1Off = 4*D*D, w2Off = 4*D*D + D*DF;
+const lg1 = 0, lb1 = D, lg2 = 2*D, lb2 = 3*D, b1 = 4*D, b2 = 4*D + DF;
+
+// Dequantize shader: int4 packed → f32 buffer
+// Runs once per layer, 1 dispatch, massively parallel
+function genDequantShader() {
+  return `
+const TOTAL:u32 = ${projParams}u;
+const GS:u32 = ${GS}u;
+
+@group(0)@binding(0) var<storage,read> packed:array<u32>;    // int4 packed weights
+@group(0)@binding(1) var<storage,read> scales:array<f32>;    // per-group scales
+@group(0)@binding(2) var<storage,read_write> out:array<f32>; // dequantized output
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let idx = gid.x;
+  if(idx >= TOTAL){return;}
+  let u32_idx = idx / 8u;
+  let bit_offset = (idx % 8u) * 4u;
+  let val = (packed[u32_idx] >> bit_offset) & 0xFu;
+  let group_idx = idx / GS;
+  let scale = scales[group_idx];
+  out[idx] = (f32(val) - 8.0) * scale;
+}
+`;
+}
+
+// Compute shader: reads pre-dequantized f32 weights directly
+// No bit shifting, no scale lookup — just f32 multiply-add
+function genComputeShader(NL) {
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const NL:u32=${NL}u;const EPS:f32=1e-5;const WG:u32=${WG}u;const TILE:u32=${TILE}u;
+const PP:u32=${projParams}u;
+
+@group(0)@binding(0) var<storage,read> W:array<f32>;      // dequantized weights [NL * projParams]
+@group(0)@binding(1) var<storage,read> LN:array<f32>;     // LN params [NL * lnParams]
+@group(0)@binding(2) var<storage,read_write> io:array<f32>;
+@group(0)@binding(3) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(4) var<uniform> u:vec4<u32>;
+
+var<workgroup> sx:array<f32,${D}>;
+var<workgroup> sr:array<f32,${WG}>;
+var<workgroup> ft:array<f32,${TILE}>;
+
+fn gelu(x:f32)->f32{let c=clamp(x,-20.0,20.0);let i=0.7978845608*(c+0.044715*c*c*c);return 0.5*c*(1.0+tanh(i));}
+
+fn wg_reduce(tid:u32,val:f32)->f32{
+  sr[tid]=val;workgroupBarrier();
+  for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+  let r=sr[0];workgroupBarrier();return r;
+}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.x;
+  let layer_off=u.y;
+
+  for(var i=tid;i<D;i+=WG){sx[i]=io[i];}workgroupBarrier();
+
+  for(var ll=0u;ll<NL;ll++){
+    let layer=layer_off+ll;
+    let WB=layer*PP;           // weight base
+    let LB=layer*${lnParams}u; // LN base
+    let kvB=layer*D*2u;
+
+    // LN1
+    var ps=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+    let mu=wg_reduce(tid,ps)/f32(D);
+    var pv=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu;pv+=d*d;}
+    let is1=min(1.0/sqrt(wg_reduce(tid,pv)/f32(D)+EPS),1e4);
+    for(var i=tid;i<D;i+=WG){
+      io[D+i]=(sx[i]-mu)*is1*LN[LB+${lg1}u+i]+LN[LB+${lb1}u+i];
+    }workgroupBarrier();
+
+    // QKV — direct f32 read, no dequant!
+    for(var i=tid;i<D;i+=WG){
+      var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+      for(var j=0u;j<D;j++){
+        let l=io[D+j];
+        qa+=l*W[WB+${wqOff}u+j*D+i];
+        ka+=l*W[WB+${wkOff}u+j*D+i];
+        va+=l*W[WB+${wvOff}u+j*D+i];
+      }
+      io[i]=qa;kv[kvB+i]=ka;kv[kvB+D+i]=va;
+    }workgroupBarrier();
+
+    // Attention (single token, pos=0)
+    for(var i=tid;i<D;i+=WG){io[D+i]=0.0;}workgroupBarrier();
+    for(var h=tid;h<NH;h+=WG){
+      let ho=h*HD;
+      for(var d=0u;d<HD;d++){io[D+ho+d]=kv[kvB+D+ho+d];}
+    }workgroupBarrier();
+
+    // Wo
+    for(var i=tid;i<D;i+=WG){
+      var a:f32=0.0;
+      for(var j=0u;j<D;j++){a+=io[D+j]*W[WB+${woOff}u+j*D+i];}
+      sx[i]+=a;
+    }workgroupBarrier();
+
+    // LN2
+    ps=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+    let mu2=wg_reduce(tid,ps)/f32(D);
+    pv=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu2;pv+=d*d;}
+    let is2=min(1.0/sqrt(wg_reduce(tid,pv)/f32(D)+EPS),1e4);
+    for(var i=tid;i<D;i+=WG){
+      io[i]=(sx[i]-mu2)*is2*LN[LB+${lg2}u+i]+LN[LB+${lb2}u+i];
+    }workgroupBarrier();
+
+    // Tiled FFN — direct f32 read
+    for(var i=tid;i<D;i+=WG){io[D+i]=0.0;}workgroupBarrier();
+    for(var tile=0u;tile<DF;tile+=TILE){
+      for(var i=tid;i<TILE;i+=WG){
+        let gi=tile+i;
+        if(gi<DF){
+          var a=LN[LB+${b1}u+gi];
+          for(var j=0u;j<D;j++){a+=io[j]*W[WB+${w1Off}u+j*DF+gi];}
+          ft[i]=gelu(a);
+        }else{ft[i]=0.0;}
+      }workgroupBarrier();
+      for(var i=tid;i<D;i+=WG){
+        var a:f32=0.0;
+        for(var j=0u;j<TILE;j++){
+          let gj=tile+j;
+          if(gj<DF){a+=ft[j]*W[WB+${w2Off}u+gj*D+i];}
+        }
+        io[D+i]+=a;
+      }workgroupBarrier();
+    }
+    for(var i=tid;i<D;i+=WG){sx[i]+=io[D+i]+LN[LB+${b2}u+i];}
+    workgroupBarrier();
+  }
+
+  for(var i=tid;i<D;i+=WG){io[i]=sx[i];}
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Buffer limit: ${(adapter.limits.maxStorageBufferBindingSize/1024/1024).toFixed(0)} MB\n`);
+
+  // Dequantized weight buffer: projParams * f32 per layer
+  // For 32 layers: projParams * 32 * 4 bytes
+  const tests = [
+    { NL: 1,  label: 'Phi-3 1L (pre-dequant)' },
+    { NL: 8,  label: 'Phi-3 8L (pre-dequant)' },
+  ];
+
+  // Check if full 32L dequantized fits
+  const full32Bytes = projParams * 32 * 4;
+  L(`Full 32L dequantized: ${(full32Bytes/1024/1024/1024).toFixed(1)} GB`);
+  if (full32Bytes <= adapter.limits.maxStorageBufferBindingSize) {
+    tests.push({ NL: 32, label: 'Phi-3 FULL 32L (pre-dequant)' });
+  } else {
+    L(`  Won't fit — need chunked approach for 32L\n`);
+    // Try chunked: 4 dispatches × 8 layers, each with dequantized weights
+    tests.push({ NL: 32, chunked: true, chunkLayers: 8, label: 'Phi-3 FULL 32L (chunked pre-dequant)' });
+  }
+
+  // Compile dequant shader
+  L('Compiling dequant shader...');
+  const dqCode = genDequantShader();
+  const dqMod = device.createShaderModule({ code: dqCode });
+  const dqPipe = device.createComputePipeline({ layout: 'auto', compute: { module: dqMod, entryPoint: 'main' } });
+  L('OK\n');
+
+  const xavierScale = 1.0 / (Math.sqrt(D) * 4.6);
+
+  for (const test of tests) {
+    const { NL, label, chunked, chunkLayers } = test;
+    L(`--- ${label} ---`);
+
+    if (chunked) {
+      // Chunked: compile shader for chunkLayers, run 4 dispatches
+      const nChunks = NL / chunkLayers;
+      const cCode = genComputeShader(chunkLayers);
+      const cMod = device.createShaderModule({ code: cCode });
+      const cPipe = device.createComputePipeline({ layout: 'auto', compute: { module: cMod, entryPoint: 'main' } });
+
+      // Dequantized weight buffer for one chunk
+      const chunkDqSize = projParams * chunkLayers;
+      const chunkDqBytes = chunkDqSize * 4;
+      L(`  ${nChunks} chunks × ${chunkLayers}L, dequant buf: ${(chunkDqBytes/1024/1024).toFixed(0)} MB`);
+
+      // Packed weights for ALL layers (int4, small)
+      const packedBuf = device.createBuffer({ size: (packedU32s + nGroups) * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      // Dequantized buffer (reused per chunk)
+      const dqBuf = device.createBuffer({ size: chunkDqBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+      // Scales buffer (per chunk)
+      const scalesBuf = device.createBuffer({ size: nGroups * chunkLayers * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      // LN params
+      const lnBuf = device.createBuffer({ size: lnParams * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const ioBuf = device.createBuffer({ size: D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+      const kvBuf = device.createBuffer({ size: NL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+      // Upload packed weights + LN for all layers
+      L(`  Uploading packed weights...`);
+      for (let l = 0; l < NL; l++) {
+        // Packed int4
+        const pBase = l * (packedU32s + nGroups);
+        const CHUNK = 1024*1024;
+        for (let off = 0; off < packedU32s; off += CHUNK) {
+          const end = Math.min(off + CHUNK, packedU32s);
+          const slice = new Uint32Array(end - off);
+          for (let i = 0; i < slice.length; i++) {
+            let v = 0; for (let b = 0; b < 8; b++) v |= (Math.floor(Math.random()*16)<<(b*4));
+            slice[i] = v;
+          }
+          device.queue.writeBuffer(packedBuf, (pBase + off) * 4, slice);
+        }
+        // Scales
+        const sc = new Float32Array(nGroups);
+        for (let i = 0; i < sc.length; i++) sc[i] = xavierScale * (Math.random()*0.3+0.85);
+        device.queue.writeBuffer(packedBuf, (pBase + packedU32s) * 4, new Uint32Array(sc.buffer));
+        // LN
+        const ln = new Float32Array(lnParams);
+        for (let i = 0; i < D; i++) { ln[i]=1; ln[2*D+i]=1; }
+        device.queue.writeBuffer(lnBuf, l * lnParams * 4, new Uint32Array(ln.buffer));
+      }
+
+      const emb = new Float32Array(D);
+      for (let i = 0; i < D; i++) emb[i] = (Math.random()-0.5)*0.1;
+
+      async function runChunkedInference() {
+        device.queue.writeBuffer(ioBuf, 0, emb);
+
+        for (let c = 0; c < nChunks; c++) {
+          // Step 1: dequantize this chunk's weights
+          const pBase = c * chunkLayers * (packedU32s + nGroups);
+          // Copy packed + scales for this chunk to per-layer dequant
+          for (let ll = 0; ll < chunkLayers; ll++) {
+            const layerPBase = (c * chunkLayers + ll) * (packedU32s + nGroups);
+            // Dequant dispatch for this layer
+            const layerPackedBuf = device.createBuffer({ size: packedU32s * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const layerScaleBuf = device.createBuffer({ size: nGroups * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+            // Copy from main packed buffer
+            const cpEnc = device.createCommandEncoder();
+            cpEnc.copyBufferToBuffer(packedBuf, layerPBase * 4, layerPackedBuf, 0, packedU32s * 4);
+            cpEnc.copyBufferToBuffer(packedBuf, (layerPBase + packedU32s) * 4, layerScaleBuf, 0, nGroups * 4);
+            device.queue.submit([cpEnc.finish()]);
+
+            const dqBG = device.createBindGroup({
+              layout: dqPipe.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: layerPackedBuf } },
+                { binding: 1, resource: { buffer: layerScaleBuf } },
+                { binding: 2, resource: { buffer: dqBuf, offset: ll * projParams * 4, size: projParams * 4 } },
+              ]
+            });
+            const dqEnc = device.createCommandEncoder();
+            const dqPass = dqEnc.beginComputePass();
+            dqPass.setPipeline(dqPipe); dqPass.setBindGroup(0, dqBG);
+            dqPass.dispatchWorkgroups(Math.ceil(projParams / 256));
+            dqPass.end();
+            device.queue.submit([dqEnc.finish()]);
+
+            layerPackedBuf.destroy();
+            layerScaleBuf.destroy();
+          }
+          await device.queue.onSubmittedWorkDone();
+
+          // Step 2: run compute on dequantized weights
+          device.queue.writeBuffer(uBuf, 0, new Uint32Array([0, c * chunkLayers, 0, 0]));
+          const cBG = device.createBindGroup({
+            layout: cPipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: dqBuf } },
+              { binding: 1, resource: { buffer: lnBuf } },
+              { binding: 2, resource: { buffer: ioBuf } },
+              { binding: 3, resource: { buffer: kvBuf } },
+              { binding: 4, resource: { buffer: uBuf } },
+            ]
+          });
+          const cEnc = device.createCommandEncoder();
+          const cPass = cEnc.beginComputePass();
+          cPass.setPipeline(cPipe); cPass.setBindGroup(0, cBG);
+          cPass.dispatchWorkgroups(1);
+          cPass.end();
+          device.queue.submit([cEnc.finish()]);
+          await device.queue.onSubmittedWorkDone();
+        }
+      }
+
+      // Validate
+      L(`  Running...`);
+      await runChunkedInference();
+      const readBuf = device.createBuffer({ size: D*4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const rEnc = device.createCommandEncoder();
+      rEnc.copyBufferToBuffer(ioBuf, 0, readBuf, 0, D*4);
+      device.queue.submit([rEnc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const check = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+      if (check.every(v=>v===0)){L(`  FAIL: zeros\n`);continue;}
+      if (check.some(v=>isNaN(v))){L(`  FAIL: NaN\n`);continue;}
+      L(`  OK [${check[0].toFixed(3)}, ${check[1].toFixed(3)}]`);
+
+      // Benchmark
+      for (let i = 0; i < 2; i++) await runChunkedInference();
+      const times = [];
+      for (let i = 0; i < 3; i++) {
+        const t0 = performance.now();
+        await runChunkedInference();
+        times.push(performance.now() - t0);
+      }
+      const mean = times.reduce((a,b)=>a+b)/times.length;
+      L(`  ${mean.toFixed(0)} ms/token | ${(1000/mean).toFixed(1)} tok/s\n`);
+
+      packedBuf.destroy(); dqBuf.destroy(); lnBuf.destroy(); ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy();
+      continue;
+    }
+
+    // Non-chunked: dequant all layers at once
+    const dqSize = projParams * NL;
+    const dqBytes = dqSize * 4;
+    L(`  Dequant buf: ${(dqBytes/1024/1024).toFixed(0)} MB`);
+
+    if (dqBytes > adapter.limits.maxStorageBufferBindingSize) {
+      L(`  SKIP: exceeds buffer limit\n`);
+      continue;
+    }
+
+    // Compile compute shader
+    const cCode = genComputeShader(NL);
+    const cMod = device.createShaderModule({ code: cCode });
+    const cPipe = device.createComputePipeline({ layout: 'auto', compute: { module: cMod, entryPoint: 'main' } });
+
+    // Buffers
+    const packedBuf = device.createBuffer({ size: packedU32s * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const scalesBuf = device.createBuffer({ size: nGroups * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const dqBuf = device.createBuffer({ size: dqBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const lnBuf = device.createBuffer({ size: lnParams * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const ioBuf = device.createBuffer({ size: D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: NL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // Upload
+    L(`  Uploading...`);
+    for (let l = 0; l < NL; l++) {
+      const CHUNK = 1024*1024;
+      for (let off = 0; off < packedU32s; off += CHUNK) {
+        const end = Math.min(off + CHUNK, packedU32s);
+        const slice = new Uint32Array(end - off);
+        for (let i = 0; i < slice.length; i++) {
+          let v = 0; for (let b = 0; b < 8; b++) v |= (Math.floor(Math.random()*16)<<(b*4));
+          slice[i] = v;
+        }
+        device.queue.writeBuffer(packedBuf, (l * packedU32s + off) * 4, slice);
+      }
+      const sc = new Float32Array(nGroups);
+      for (let i = 0; i < sc.length; i++) sc[i] = xavierScale * (Math.random()*0.3+0.85);
+      device.queue.writeBuffer(scalesBuf, l * nGroups * 4, new Uint32Array(sc.buffer));
+      const ln = new Float32Array(lnParams);
+      for (let i = 0; i < D; i++) { ln[i]=1; ln[2*D+i]=1; }
+      device.queue.writeBuffer(lnBuf, l * lnParams * 4, new Uint32Array(ln.buffer));
+    }
+
+    // Dequantize all layers
+    L(`  Dequantizing ${NL} layers...`);
+    for (let l = 0; l < NL; l++) {
+      const dqBG = device.createBindGroup({
+        layout: dqPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: packedBuf, offset: l * packedU32s * 4, size: packedU32s * 4 } },
+          { binding: 1, resource: { buffer: scalesBuf, offset: l * nGroups * 4, size: nGroups * 4 } },
+          { binding: 2, resource: { buffer: dqBuf, offset: l * projParams * 4, size: projParams * 4 } },
+        ]
+      });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(dqPipe); pass.setBindGroup(0, dqBG);
+      pass.dispatchWorkgroups(Math.ceil(projParams / 256));
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+    await device.queue.onSubmittedWorkDone();
+    L(`  Dequantized OK`);
+
+    const emb = new Float32Array(D);
+    for (let i = 0; i < D; i++) emb[i] = (Math.random()-0.5)*0.1;
+
+    async function runInference() {
+      device.queue.writeBuffer(ioBuf, 0, emb);
+      device.queue.writeBuffer(uBuf, 0, new Uint32Array([0, 0, 0, 0]));
+      const cBG = device.createBindGroup({
+        layout: cPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: dqBuf } },
+          { binding: 1, resource: { buffer: lnBuf } },
+          { binding: 2, resource: { buffer: ioBuf } },
+          { binding: 3, resource: { buffer: kvBuf } },
+          { binding: 4, resource: { buffer: uBuf } },
+        ]
+      });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(cPipe); pass.setBindGroup(0, cBG);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // Validate
+    L(`  Running...`);
+    await runInference();
+    const readBuf = device.createBuffer({ size: D*4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const rEnc = device.createCommandEncoder();
+    rEnc.copyBufferToBuffer(ioBuf, 0, readBuf, 0, D*4);
+    device.queue.submit([rEnc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+    if (check.every(v=>v===0)){L(`  FAIL: zeros\n`);continue;}
+    if (check.some(v=>isNaN(v))){L(`  FAIL: NaN\n`);continue;}
+    L(`  OK [${check[0].toFixed(3)}, ${check[1].toFixed(3)}]`);
+
+    // Benchmark
+    for (let i = 0; i < 3; i++) await runInference();
+    const times = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      await runInference();
+      times.push(performance.now() - t0);
+    }
+    const mean = times.reduce((a,b)=>a+b)/times.length;
+    L(`  ${mean.toFixed(0)} ms/token | ${(1000/mean).toFixed(1)} tok/s\n`);
+
+    packedBuf.destroy(); scalesBuf.destroy(); dqBuf.destroy(); lnBuf.destroy();
+    ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy(); readBuf.destroy();
+  }
+
+  L('Done. Compare with int4 on-the-fly: 1L=122ms, 8L=338ms, 32L=1350ms');
+}
+
+run().catch(e => L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>

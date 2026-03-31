@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Large Model Fusion Benchmark</title>
+<style>
+body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}
+pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8;max-height:80vh;overflow-y:auto}
+button{background:#1a73e8;color:#fff;border:none;padding:0.75rem 2rem;border-radius:6px;font-family:inherit;font-size:1rem;cursor:pointer;margin:0.5rem 0.5rem 1rem 0}
+button:hover{background:#1565c0}
+button:disabled{background:#333;cursor:not-allowed}
+</style>
+</head><body>
+<h2>Large Model Fusion Benchmark</h2>
+<p>Tests parallel fused kernel at GPT-2 scale (D=768, D=1024)</p>
+<button onclick="runSingle()">Quick Test (Phi-3-mini 1 layer, TILED)</button>
+<button onclick="runAll()">Full Sweep</button>
+<pre id="log">Ready. Click a button.</pre>
+
+<script type="module">
+// Import the parallel shader generator from the SDK
+// We inline it here to avoid cross-project dependencies
+
+function makeConfig(D, NH, NL, SL=64, WG=64) {
+  const HD = D / NH;
+  const DF = D * 4;
+  const perLayer = 4*D + 4*D*D + 2*D*DF + DF + D;
+  return { D, NH, HD, DF, SL, NL, perLayer, totalWeights: perLayer * NL, WG };
+}
+
+function generateParallelShader(cfg) {
+  const { D, NH, HD, DF, SL, NL, perLayer, WG } = cfg;
+  let p=0;
+  const o={LG:p,LB:(p+=D),WQ:(p+=D),WK:(p+=D*D),WV:(p+=D*D),WO:(p+=D*D),LG2:(p+=D*D),LB2:(p+=D),W1:(p+=D),B1:(p+=D*DF),W2:(p+=DF),B2:(p+=DF*D)};
+
+  // Effective shared memory limit ~16KB on Apple Silicon (despite 32KB reported)
+  const TILE = 256;
+  const twoArrayBytes = (D + Math.max(D, DF) + WG) * 4;
+  const oneArrayTiledBytes = (D + WG + TILE) * 4;
+
+  // Strategy:
+  // 'none': both sx and sb in shared, no tiling (D <= ~800)
+  // 'tiled': sx and sb in shared, FFN tiled (D <= ~1792)
+  // 'lean': only sx in shared, sb uses global out buffer, FFN tiled (D <= ~3072)
+  let strategy = 'none';
+  if (twoArrayBytes > 15000) strategy = 'tiled';
+  if ((D + D + WG + TILE) * 4 > 15000) strategy = 'lean';
+
+  const sharedBufSize = strategy === 'none' ? Math.max(D, DF) : (strategy === 'tiled' ? D : 0);
+
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const SL:u32=${SL}u;const NL:u32=${NL}u;const EPS:f32=1e-5;const PL:u32=${perLayer}u;const WG:u32=${WG}u;
+${needsTiling ? `const TILE:u32=${TILE}u;` : ''}
+
+@group(0)@binding(0) var<storage,read> W:array<f32>;
+@group(0)@binding(1) var<storage,read> emb:array<f32>;
+@group(0)@binding(2) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(3) var<storage,read_write> out:array<f32>;
+@group(0)@binding(4) var<uniform> u:vec4<u32>;
+
+var<workgroup> sx:array<f32,${D}>;
+${sharedBufSize > 0 ? `var<workgroup> sb:array<f32,${sharedBufSize}>;` : '// lean mode: sb uses global out buffer'}
+var<workgroup> sr:array<f32,${WG}>;
+${strategy !== 'none' ? `var<workgroup> ffn_tile:array<f32,${TILE}>;` : ''}
+
+fn gelu(x:f32)->f32{let i=0.7978845608*(x+0.044715*x*x*x);return 0.5*x*(1.0+tanh(i));}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>,@builtin(workgroup_id) wid:vec3<u32>){
+  let tid=lid.x;let nt=u.x;if(wid.x>=1u){return;}
+  // Scratch offset in global out buffer (for lean mode)
+  ${strategy === 'lean' ? `let SC = SL * D;  // scratch area starts after output tokens` : ''}
+
+  for(var t=0u;t<nt;t++){
+    let tb=t*D;
+    for(var i=tid;i<D;i+=WG){sx[i]=emb[tb+i];}workgroupBarrier();
+    for(var layer=0u;layer<NL;layer++){
+      let LB=layer*PL;let kvB=layer*SL*D;
+      // LN1
+      var ps:f32=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu=sr[0]/f32(D);workgroupBarrier();
+      var pv:f32=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu;pv+=d*d;}sr[tid]=pv;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is1=1.0/sqrt(sr[0]/f32(D)+EPS);workgroupBarrier();
+      // LN1 output → ${strategy === 'lean' ? 'out[SC+...]' : 'sb[...]'}
+      for(var i=tid;i<D;i+=WG){${strategy === 'lean' ? `out[SC+i]` : `sb[i]`}=(sx[i]-mu)*is1*W[LB+${o.LG}u+i]+W[LB+${o.LB}u+i];}workgroupBarrier();
+      // QKV
+      for(var i=tid;i<D;i+=WG){
+        var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+        for(var j=0u;j<D;j++){let l=${strategy === 'lean' ? `out[SC+j]` : `sb[j]`};qa+=l*W[LB+${o.WQ}u+j*D+i];ka+=l*W[LB+${o.WK}u+j*D+i];va+=l*W[LB+${o.WV}u+j*D+i];}
+        out[tb+i]=qa;kv[kvB+t*D+i]=ka;kv[NL*SL*D+kvB+t*D+i]=va;
+      }workgroupBarrier();
+      // Attn — zero accumulator
+      for(var i=tid;i<D;i+=WG){${strategy === 'lean' ? `out[SC+i]` : `sb[i]`}=0.0;}workgroupBarrier();
+      for(var h=tid;h<NH;h+=WG){
+        let ho=h*HD;var mx:f32=-1e9;
+        for(var s=0u;s<=t;s++){var sc:f32=0.0;for(var d=0u;d<HD;d++){sc+=out[tb+ho+d]*kv[kvB+s*D+ho+d];}sc/=sqrt(f32(HD));if(sc>mx){mx=sc;}}
+        var es:f32=0.0;var ho2:array<f32,${HD}>;for(var d=0u;d<HD;d++){ho2[d]=0.0;}
+        for(var s=0u;s<=t;s++){var sc:f32=0.0;for(var d=0u;d<HD;d++){sc+=out[tb+ho+d]*kv[kvB+s*D+ho+d];}let w=exp(sc/sqrt(f32(HD))-mx);es+=w;for(var d=0u;d<HD;d++){ho2[d]+=w*kv[NL*SL*D+kvB+s*D+ho+d];}}
+        if(es>0.0){for(var d=0u;d<HD;d++){${strategy === 'lean' ? `out[SC+ho+d]` : `sb[ho+d]`}=ho2[d]/es;}}
+      }workgroupBarrier();
+      // Wo + res
+      for(var i=tid;i<D;i+=WG){var a:f32=0.0;for(var j=0u;j<D;j++){a+=${strategy === 'lean' ? `out[SC+j]` : `sb[j]`}*W[LB+${o.WO}u+j*D+i];}sx[i]=sx[i]+a;}workgroupBarrier();
+      // LN2
+      ps=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu2=sr[0]/f32(D);workgroupBarrier();
+      pv=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu2;pv+=d*d;}sr[tid]=pv;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is2=1.0/sqrt(sr[0]/f32(D)+EPS);workgroupBarrier();
+      // LN2 output
+      for(var i=tid;i<D;i+=WG){${strategy === 'lean' ? `out[SC+i]` : `sb[i]`}=(sx[i]-mu2)*is2*W[LB+${o.LG2}u+i]+W[LB+${o.LB2}u+i];}workgroupBarrier();
+
+${strategy !== 'none' ? `
+      // === TILED FFN (streaming up-projection in blocks of ${TILE}) ===
+      // LN2 output is in ${strategy === 'lean' ? 'out[SC+...]' : 'sb[...]'}
+      // Save LN2 output to out[tb+...] for reading during tiled matmul
+      for(var i=tid;i<D;i+=WG){out[tb+i]=${strategy === 'lean' ? `out[SC+i]` : `sb[i]`};}workgroupBarrier();
+      // Zero accumulator for down-projection in out[SC+...]
+      for(var i=tid;i<D;i+=WG){out[SC+i]=0.0;}workgroupBarrier();
+
+      for(var tile=0u;tile<DF;tile+=TILE){
+        for(var i=tid;i<TILE;i+=WG){
+          let gi=tile+i;
+          if(gi<DF){
+            var a=W[LB+${o.B1}u+gi];
+            for(var j=0u;j<D;j++){a+=out[tb+j]*W[LB+${o.W1}u+j*DF+gi];}
+            ffn_tile[i]=gelu(a);
+          } else { ffn_tile[i]=0.0; }
+        }workgroupBarrier();
+
+        for(var i=tid;i<D;i+=WG){
+          var a:f32=0.0;
+          for(var j=0u;j<TILE;j++){
+            let gj=tile+j;
+            if(gj<DF){a+=ffn_tile[j]*W[LB+${o.W2}u+gj*D+i];}
+          }
+          out[SC+i]+=a;
+        }workgroupBarrier();
+      }
+      // Add bias + residual
+      for(var i=tid;i<D;i+=WG){sx[i]=sx[i]+out[SC+i]+W[LB+${o.B2}u+i];}workgroupBarrier();
+` : `
+      // FFN up (non-tiled, fits in shared memory)
+      for(var i=tid;i<DF;i+=WG){var a=W[LB+${o.B1}u+i];for(var j=0u;j<D;j++){a+=sb[j]*W[LB+${o.W1}u+j*DF+i];}out[i]=gelu(a);}workgroupBarrier();
+      // FFN down + res
+      for(var i=tid;i<D;i+=WG){var a=W[LB+${o.B2}u+i];for(var j=0u;j<DF;j++){a+=out[j]*W[LB+${o.W2}u+j*D+i];}sx[i]=sx[i]+a;}workgroupBarrier();
+`}
+    }
+    for(var i=tid;i<D;i+=WG){out[tb+i]=sx[i];}workgroupBarrier();
+  }
+}`;
+}
+
+const logEl = document.getElementById('log');
+function L(msg) { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+async function initGPU() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const features = [];
+  if (adapter.features.has('shader-f16')) features.push('shader-f16');
+  const device = await adapter.requestDevice({
+    requiredFeatures: features,
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  const info = adapter.info || {};
+  return { device, info };
+}
+
+function randWeights(n, D) {
+  const w = new Float32Array(n);
+  const s = Math.sqrt(2.0 / D);
+  for (let i = 0; i < n; i++) {
+    const u1 = Math.random() || 1e-9;
+    const u2 = Math.random();
+    w[i] = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2) * s;
+  }
+  return w;
+}
+
+async function benchConfig(device, D, NH, NL, SL=64, WG=64, warmup=3, runs=5) {
+  const cfg = makeConfig(D, NH, NL, SL, WG);
+  const code = generateParallelShader(cfg);
+
+  let pipe;
+  try {
+    pipe = device.createComputePipeline({
+      layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: 'main' }
+    });
+  } catch (e) {
+    return { error: `Shader compile: ${e.message}` };
+  }
+
+  const { totalWeights, perLayer, DF } = cfg;
+  const wBuf = device.createBuffer({ size: totalWeights * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const eBuf = device.createBuffer({ size: SL * D * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const kvBuf = device.createBuffer({ size: NL * SL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const outSize = (Math.max(SL * D, DF) + D) * 4;  // +D for lean scratch area
+  const oBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const packed = randWeights(totalWeights, D);
+  for (let l = 0; l < NL; l++) {
+    const base = l * perLayer;
+    for (let i = 0; i < D; i++) { packed[base + i] = 1.0; packed[base + D + i] = 0.0; }
+    const ln2Off = 4 * D * D + 2 * D;
+    for (let i = 0; i < D; i++) { packed[base + ln2Off + i] = 1.0; packed[base + ln2Off + D + i] = 0.0; }
+  }
+
+  device.queue.writeBuffer(wBuf, 0, packed);
+  const emb = new Float32Array(SL * D);
+  for (let i = 0; i < emb.length; i++) emb[i] = (Math.random() - 0.5) * 0.1;
+  device.queue.writeBuffer(eBuf, 0, emb);
+  device.queue.writeBuffer(uBuf, 0, new Uint32Array([SL, 0, 0, 0]));
+
+  const bg = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: wBuf } },
+      { binding: 1, resource: { buffer: eBuf } },
+      { binding: 2, resource: { buffer: kvBuf } },
+      { binding: 3, resource: { buffer: oBuf } },
+      { binding: 4, resource: { buffer: uBuf } },
+    ]
+  });
+
+  async function run() {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Validation run: check output isn't zeros (detect silent GPU failure)
+  await run();
+  {
+    const readBuf = device.createBuffer({ size: D * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(oBuf, 0, readBuf, 0, D * 4);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap(); readBuf.destroy();
+    const allZero = check.every(v => v === 0);
+    const hasNaN = check.some(v => isNaN(v));
+    if (allZero || hasNaN) {
+      wBuf.destroy(); eBuf.destroy(); kvBuf.destroy(); oBuf.destroy(); uBuf.destroy();
+      return { error: allZero ? 'Silent failure: output is all zeros' : 'NaN in output' };
+    }
+  }
+
+  for (let i = 0; i < warmup; i++) await run();
+  const times = [];
+  for (let i = 0; i < runs; i++) {
+    const t0 = performance.now();
+    await run();
+    times.push(performance.now() - t0);
+  }
+
+  const sorted = [...times].sort((a, b) => a - b);
+  const mean = times.reduce((s, t) => s + t, 0) / times.length;
+  const std = Math.sqrt(times.reduce((s, t) => s + (t - mean) ** 2, 0) / times.length);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const params = totalWeights;
+  const paramStr = params > 1e6 ? `${(params/1e6).toFixed(1)}M` : `${(params/1e3).toFixed(0)}K`;
+
+  // Cleanup
+  wBuf.destroy(); eBuf.destroy(); kvBuf.destroy(); oBuf.destroy(); uBuf.destroy();
+
+  return { mean, std, median, tok_per_sec: (SL / median) * 1000, params: paramStr, runs: times.length };
+}
+
+// Chunked benchmark: split NL layers into chunks of chunkSize
+// Each chunk is a separate dispatch with its own weight buffer
+// Token loop is still fused INSIDE each chunk
+async function benchChunked(device, D, NH, NL, chunkSize=8, SL=64, WG=64, warmup=2, runs=3) {
+  const nChunks = Math.ceil(NL / chunkSize);
+  const DF = D * 4;
+  const cfg0 = makeConfig(D, NH, chunkSize, SL, WG);
+  const perLayer = cfg0.perLayer;
+  const chunkWeights = perLayer * chunkSize;
+  const totalParams = perLayer * NL;
+  const paramStr = totalParams > 1e9 ? `${(totalParams/1e9).toFixed(1)}B` : `${(totalParams/1e6).toFixed(0)}M`;
+
+  // Generate shader for chunkSize layers
+  const code = generateParallelShader(cfg0);
+  let pipe;
+  try {
+    pipe = device.createComputePipeline({
+      layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: 'main' }
+    });
+  } catch (e) {
+    return { error: `Shader compile: ${e.message}` };
+  }
+
+  // Shared buffers (reused across chunks)
+  // emb/out: we ping-pong — chunk 0 reads emb, writes out; chunk 1 reads out, writes emb2
+  const bufSize = SL * D * 4;
+  const outSize = (Math.max(SL * D, DF) + D) * 4;  // +D for lean scratch area
+  const embBuf = device.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const outBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  // Per-chunk: weight buffer + KV cache
+  const chunks = [];
+  for (let c = 0; c < nChunks; c++) {
+    const layersInChunk = Math.min(chunkSize, NL - c * chunkSize);
+    const wBuf = device.createBuffer({ size: chunkWeights * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: layersInChunk * SL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+    // Random weights with LN defaults
+    const packed = randWeights(chunkWeights, D);
+    for (let l = 0; l < layersInChunk; l++) {
+      const base = l * perLayer;
+      for (let i = 0; i < D; i++) { packed[base + i] = 1.0; packed[base + D + i] = 0.0; }
+      const ln2Off = 4 * D * D + 2 * D;
+      for (let i = 0; i < D; i++) { packed[base + ln2Off + i] = 1.0; packed[base + ln2Off + D + i] = 0.0; }
+    }
+    device.queue.writeBuffer(wBuf, 0, packed);
+
+    const bg = device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: wBuf } },
+        { binding: 1, resource: { buffer: embBuf } },  // input: reads from here
+        { binding: 2, resource: { buffer: kvBuf } },
+        { binding: 3, resource: { buffer: outBuf } },  // output: writes here
+        { binding: 4, resource: { buffer: uBuf } },
+      ]
+    });
+    chunks.push({ wBuf, kvBuf, bg });
+  }
+
+  // Random embeddings
+  const emb = new Float32Array(SL * D);
+  for (let i = 0; i < emb.length; i++) emb[i] = (Math.random() - 0.5) * 0.1;
+
+  async function run() {
+    // Upload initial embeddings
+    device.queue.writeBuffer(embBuf, 0, emb);
+    device.queue.writeBuffer(uBuf, 0, new Uint32Array([SL, 0, 0, 0]));
+
+    for (let c = 0; c < nChunks; c++) {
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, chunks[c].bg);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+
+      // After this chunk, copy output → input for next chunk
+      if (c < nChunks - 1) {
+        enc.copyBufferToBuffer(outBuf, 0, embBuf, 0, bufSize);
+      }
+
+      device.queue.submit([enc.finish()]);
+    }
+    await device.queue.onSubmittedWorkDone();
+    return nChunks;
+  }
+
+  for (let i = 0; i < warmup; i++) await run();
+  const times = [];
+  let dispatches = 0;
+  for (let i = 0; i < runs; i++) {
+    const t0 = performance.now();
+    dispatches = await run();
+    times.push(performance.now() - t0);
+  }
+
+  const sorted = [...times].sort((a, b) => a - b);
+  const mean = times.reduce((s, t) => s + t, 0) / times.length;
+  const std = Math.sqrt(times.reduce((s, t) => s + (t - mean) ** 2, 0) / times.length);
+  const median = sorted[Math.floor(sorted.length / 2)];
+
+  // Cleanup
+  embBuf.destroy(); outBuf.destroy(); uBuf.destroy();
+  for (const c of chunks) { c.wBuf.destroy(); c.kvBuf.destroy(); }
+
+  return { mean, std, median, tok_per_sec: (SL / median) * 1000, params: paramStr, runs: times.length, dispatches };
+}
+
+const CONFIGS = [
+  { D: 768,  NH: 12, NL: 1,  label: 'D=768 (no tile)' },
+  { D: 896,  NH: 14, NL: 1,  label: 'Qwen2-0.5B 1L (tiled)' },
+  { D: 1024, NH: 16, NL: 1,  label: 'GPT-2 Med 1L (tiled)' },
+  { D: 1792, NH: 16, NL: 1,  label: 'D=1792 1L (tiled)' },
+  { D: 2048, NH: 32, NL: 1,  label: 'Llama-1B 1L (lean)' },
+  { D: 3072, NH: 32, NL: 1,  label: 'Phi-3-mini 1L (lean)' },
+];
+
+window.runSingle = async function() {
+  logEl.textContent = '';
+  L('Initializing WebGPU...');
+  const { device, info } = await initGPU();
+  L(`GPU: ${info.vendor} ${info.architecture}\n`);
+  L('Testing D=3072, H=32, L=1 (one Phi-3-mini layer, TILED FFN)...');
+  const r = await benchConfig(device, 3072, 32, 1, 64, 64, 2, 3);
+  if (r.error) { L(`ERROR: ${r.error}`); return; }
+  L(`  ${r.mean.toFixed(1)} ± ${r.std.toFixed(1)} ms | ${r.tok_per_sec.toFixed(0)} tok/s | ${r.params} params`);
+  L('\nPhi-3-mini architecture compiles and runs with tiled FFN!');
+};
+
+window.runAll = async function() {
+  logEl.textContent = '';
+  L('Initializing WebGPU...');
+  const { device, info } = await initGPU();
+  L(`GPU: ${info.vendor} ${info.architecture}\n`);
+
+  const results = [];
+  for (const c of CONFIGS) {
+    L(`--- ${c.label} ---`);
+    const sl = c.SL || 64;
+    const r = c.chunked
+      ? await benchChunked(device, c.D, c.NH, c.NL, c.chunkSize, sl)
+      : await benchConfig(device, c.D, c.NH, c.NL, sl);
+    if (r.error) {
+      L(`  ERROR: ${r.error}\n`);
+      results.push({ ...c, error: r.error });
+    } else {
+      L(`  ${r.mean.toFixed(1)} ± ${r.std.toFixed(1)} ms | ${r.tok_per_sec.toFixed(0)} tok/s | ${r.params} params\n`);
+      results.push({ ...c, ...r });
+    }
+  }
+
+  L('\n========== RESULTS ==========');
+  L('Config                              | Params  |    Time (ms) |  tok/s');
+  L('------------------------------------|---------|--------------|-------');
+  for (const r of results) {
+    if (r.error) {
+      L(`${r.label.padEnd(35)} | ${'ERROR'.padStart(7)} | ${r.error}`);
+    } else {
+      L(`${r.label.padEnd(35)} | ${r.params.padStart(7)} | ${(r.mean.toFixed(1)+' ± '+r.std.toFixed(1)).padStart(12)} | ${r.tok_per_sec.toFixed(0).padStart(6)}`);
+    }
+  }
+};
+</script>
+</body></html>

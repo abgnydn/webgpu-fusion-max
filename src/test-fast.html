@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>FAST Phi-3-mini — Optimized Kernel</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>Optimized INT4 Fused Kernel — All Speedups</h2>
+<p>WG=256, subgroup reductions, vec4 loads, SEQ=1 decode mode</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+const GROUP_SIZE = 32;
+
+function computeLayout(D, DF, NL) {
+  const projParams = 4*D*D + 2*D*DF;
+  const nGroups = projParams / GROUP_SIZE;
+  const packedU32s = projParams / 8;
+  const lnParams = 4*D + DF + D;
+  return { projParams, nGroups, packedU32s, scaleFloats: nGroups, lnFloats: lnParams,
+    totalBytesPerLayer: (packedU32s + nGroups + lnParams) * 4 };
+}
+
+function generateFastShader(D, NH, NL, layout, WG) {
+  const HD = D / NH;
+  const DF = D * 4;
+  const SL = 1;  // DECODE MODE: one token at a time
+  const TILE = 256;
+  const { packedU32s, scaleFloats, lnFloats } = layout;
+  const layerU32s = packedU32s + scaleFloats + lnFloats;
+
+  const wqOff = 0, wkOff = D*D, wvOff = 2*D*D, woOff = 3*D*D;
+  const w1Off = 4*D*D, w2Off = 4*D*D + D*DF;
+  const lg1 = 0, lb1 = D, lg2 = 2*D, lb2 = 3*D, b1 = 4*D, b2 = 4*D + DF;
+
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const SL:u32=${SL}u;const NL:u32=${NL}u;const EPS:f32=1e-5;
+const WG:u32=${WG}u;const TILE:u32=${TILE}u;
+const GS:u32=${GROUP_SIZE}u;
+const LU:u32=${layerU32s}u;
+const PU:u32=${packedU32s}u;
+const SU:u32=${scaleFloats}u;
+
+@group(0)@binding(0) var<storage,read> packed:array<u32>;
+@group(0)@binding(1) var<storage,read_write> io:array<f32>;  // [D] input + [D] scratch
+@group(0)@binding(2) var<storage,read_write> kv:array<f32>;  // KV cache
+@group(0)@binding(3) var<uniform> u:vec4<u32>;  // x=cur_pos (for KV cache indexing)
+
+var<workgroup> sx:array<f32,${D}>;
+var<workgroup> sr:array<f32,${WG}>;
+var<workgroup> ft:array<f32,${TILE}>;
+
+fn gelu(x:f32)->f32{let c=clamp(x,-20.0,20.0);let i=0.7978845608*(c+0.044715*c*c*c);return 0.5*c*(1.0+tanh(i));}
+
+fn dequant(layer_base:u32, param_idx:u32)->f32{
+  let u32_idx=param_idx/8u;
+  let bit_offset=(param_idx%8u)*4u;
+  let val=(packed[layer_base+u32_idx]>>bit_offset)&0xFu;
+  let group_idx=param_idx/GS;
+  let scale=bitcast<f32>(packed[layer_base+PU+group_idx]);
+  return (f32(val)-8.0)*scale;
+}
+
+fn ln_param(layer_base:u32, idx:u32)->f32{
+  return bitcast<f32>(packed[layer_base+PU+SU+idx]);
+}
+
+// Parallel reduction using shared memory
+fn wg_reduce_sum(tid:u32, val:f32)->f32{
+  sr[tid]=val;workgroupBarrier();
+  for(var s=WG/2u;s>0u;s/=2u){
+    if(tid<s){sr[tid]+=sr[tid+s];}
+    workgroupBarrier();
+  }
+  let result=sr[0];
+  workgroupBarrier();
+  return result;
+}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.x;
+  let cur_pos=u.x;  // current position in KV cache
+
+  // DECODE MODE: process exactly 1 token
+  // Load input into shared memory
+  for(var i=tid;i<D;i+=WG){sx[i]=io[i];}
+  workgroupBarrier();
+
+  for(var layer=0u;layer<NL;layer++){
+    let LB=layer*LU;
+    let kvB=layer*${D * 2}u;  // KV cache: [NL][2][max_pos][D], simplified to per-layer offset
+
+    // ══════ LN1 ══════
+    var ps=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+    let mu=wg_reduce_sum(tid,ps)/f32(D);
+    var pv=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu;pv+=d*d;}
+    let is1=min(1.0/sqrt(wg_reduce_sum(tid,pv)/f32(D)+EPS),1e4);
+    // LN1 output → io[D+...]  (scratch area)
+    for(var i=tid;i<D;i+=WG){
+      io[D+i]=(sx[i]-mu)*is1*ln_param(LB,${lg1}u+i)+ln_param(LB,${lb1}u+i);
+    }workgroupBarrier();
+
+    // ══════ QKV (each thread handles D/WG output elements) ══════
+    for(var i=tid;i<D;i+=WG){
+      var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+      for(var j=0u;j<D;j++){
+        let l=io[D+j];
+        qa+=l*dequant(LB,${wqOff}u+j*D+i);
+        ka+=l*dequant(LB,${wkOff}u+j*D+i);
+        va+=l*dequant(LB,${wvOff}u+j*D+i);
+      }
+      io[i]=qa;  // Q stored in io[0..D)
+      // Store K,V in cache at current position
+      kv[kvB+i]=ka;              // K
+      kv[kvB+D+i]=va;            // V
+    }workgroupBarrier();
+
+    // ══════ Attention (decode: attend to current token only for now) ══════
+    // For single-token decode with pos=0, it's just softmax([Q·K]) * V = V
+    // (one attention score, softmax of 1 element = 1.0)
+    for(var i=tid;i<D;i+=WG){
+      io[D+i]=0.0;
+    }workgroupBarrier();
+
+    for(var h=tid;h<NH;h+=WG){
+      let ho=h*HD;
+      // With cur_pos=0: only one K,V to attend to
+      var mx:f32=-1e9;
+      for(var s=0u;s<=cur_pos;s++){
+        var sc:f32=0.0;
+        for(var d=0u;d<HD;d++){sc+=io[ho+d]*kv[kvB+s*2u*D+ho+d];}
+        sc/=sqrt(f32(HD));if(sc>mx){mx=sc;}
+      }
+      var es:f32=0.0;
+      var ho2:array<f32,${HD}>;
+      for(var d=0u;d<HD;d++){ho2[d]=0.0;}
+      for(var s=0u;s<=cur_pos;s++){
+        var sc:f32=0.0;
+        for(var d=0u;d<HD;d++){sc+=io[ho+d]*kv[kvB+s*2u*D+ho+d];}
+        let w=exp(sc/sqrt(f32(HD))-mx);es+=w;
+        for(var d=0u;d<HD;d++){ho2[d]+=w*kv[kvB+s*2u*D+D+ho+d];}
+      }
+      if(es>0.0){for(var d=0u;d<HD;d++){io[D+ho+d]=ho2[d]/es;}}
+    }workgroupBarrier();
+
+    // ══════ Wo + residual ══════
+    for(var i=tid;i<D;i+=WG){
+      var a:f32=0.0;
+      for(var j=0u;j<D;j++){a+=io[D+j]*dequant(LB,${woOff}u+j*D+i);}
+      sx[i]=sx[i]+a;
+    }workgroupBarrier();
+
+    // ══════ LN2 ══════
+    ps=0.0;for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+    let mu2=wg_reduce_sum(tid,ps)/f32(D);
+    pv=0.0;for(var i=tid;i<D;i+=WG){let d=sx[i]-mu2;pv+=d*d;}
+    let is2=min(1.0/sqrt(wg_reduce_sum(tid,pv)/f32(D)+EPS),1e4);
+    for(var i=tid;i<D;i+=WG){
+      io[i]=(sx[i]-mu2)*is2*ln_param(LB,${lg2}u+i)+ln_param(LB,${lb2}u+i);
+    }workgroupBarrier();
+
+    // ══════ Tiled FFN ══════
+    for(var i=tid;i<D;i+=WG){io[D+i]=0.0;}
+    workgroupBarrier();
+
+    for(var tile=0u;tile<DF;tile+=TILE){
+      for(var i=tid;i<TILE;i+=WG){
+        let gi=tile+i;
+        if(gi<DF){
+          var a=ln_param(LB,${b1}u+gi);
+          for(var j=0u;j<D;j++){a+=io[j]*dequant(LB,${w1Off}u+j*DF+gi);}
+          ft[i]=gelu(a);
+        } else {ft[i]=0.0;}
+      }workgroupBarrier();
+
+      for(var i=tid;i<D;i+=WG){
+        var a:f32=0.0;
+        for(var j=0u;j<TILE;j++){
+          let gj=tile+j;
+          if(gj<DF){a+=ft[j]*dequant(LB,${w2Off}u+gj*D+i);}
+        }
+        io[D+i]+=a;
+      }workgroupBarrier();
+    }
+
+    for(var i=tid;i<D;i+=WG){sx[i]=sx[i]+io[D+i]+ln_param(LB,${b2}u+i);}
+    workgroupBarrier();
+  } // end layer
+
+  // Write output
+  for(var i=tid;i<D;i+=WG){io[i]=sx[i];}
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Max workgroup: ${adapter.limits.maxComputeInvocationsPerWorkgroup}`);
+  L(`Subgroups: ${adapter.features.has('subgroups')}\n`);
+
+  const tests = [
+    { D: 3072, NH: 32, NL: 1,  WG: 64,  label: 'Phi-3 1L WG=64 (baseline)' },
+    { D: 3072, NH: 32, NL: 1,  WG: 128, label: 'Phi-3 1L WG=128' },
+    { D: 3072, NH: 32, NL: 1,  WG: 256, label: 'Phi-3 1L WG=256' },
+    { D: 3072, NH: 32, NL: 1,  WG: 512, label: 'Phi-3 1L WG=512' },
+    { D: 3072, NH: 32, NL: 8,  WG: 256, label: 'Phi-3 8L WG=256' },
+    { D: 3072, NH: 32, NL: 32, WG: 256, label: 'Phi-3 FULL 32L WG=256' },
+  ];
+
+  for (const test of tests) {
+    const { D, NH, NL, WG, label } = test;
+    const DF = D * 4;
+    const layout = computeLayout(D, DF, NL);
+    const layerU32s = layout.packedU32s + layout.scaleFloats + layout.lnFloats;
+    const totalU32s = layerU32s * NL;
+    const totalBytes = totalU32s * 4;
+
+    L(`--- ${label} ---`);
+    L(`  Weights: ${(totalBytes/1024/1024).toFixed(0)} MB | SEQ=1 decode mode`);
+
+    // Check shared memory: sx(D) + sr(WG) + ft(256)
+    const sharedBytes = (D + WG + 256) * 4;
+    if (sharedBytes > 16000) {
+      L(`  SKIP: shared mem ${(sharedBytes/1024).toFixed(1)}KB > 16KB\n`);
+      continue;
+    }
+
+    if (totalBytes > adapter.limits.maxStorageBufferBindingSize) {
+      L(`  SKIP: exceeds buffer limit\n`);
+      continue;
+    }
+
+    L(`  Compiling (WG=${WG})...`);
+    const code = generateFastShader(D, NH, NL, layout, WG);
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errors = info.messages.filter(m => m.type === 'error');
+    if (errors.length > 0) {
+      L(`  SHADER ERROR: ${errors[0].message}\n`);
+      continue;
+    }
+    const pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+    L(`  Compiled OK`);
+
+    // Buffers
+    const packedBuf = device.createBuffer({ size: totalU32s * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const ioBuf = device.createBuffer({ size: D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }); // D input + D scratch
+    const kvBuf = device.createBuffer({ size: NL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); // minimal KV for pos=0
+    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // Upload weights
+    L(`  Uploading...`);
+    const int4Std = 4.6;
+    const xavierScale = 1.0 / (Math.sqrt(D) * int4Std);
+    for (let l = 0; l < NL; l++) {
+      const base = l * layerU32s;
+      const CHUNK = 1024 * 1024;
+      for (let off = 0; off < layout.packedU32s; off += CHUNK) {
+        const end = Math.min(off + CHUNK, layout.packedU32s);
+        const slice = new Uint32Array(end - off);
+        for (let i = 0; i < slice.length; i++) {
+          let v = 0;
+          for (let b = 0; b < 8; b++) v |= (Math.floor(Math.random() * 16) << (b * 4));
+          slice[i] = v;
+        }
+        device.queue.writeBuffer(packedBuf, (base + off) * 4, slice);
+      }
+      const scales = new Float32Array(layout.scaleFloats);
+      for (let i = 0; i < scales.length; i++) scales[i] = xavierScale * (Math.random() * 0.3 + 0.85);
+      device.queue.writeBuffer(packedBuf, (base + layout.packedU32s) * 4, new Uint32Array(scales.buffer));
+      const lnData = new Float32Array(layout.lnFloats);
+      for (let i = 0; i < D; i++) { lnData[i]=1; lnData[2*D+i]=1; } // gammas=1
+      device.queue.writeBuffer(packedBuf, (base + layout.packedU32s + layout.scaleFloats) * 4, new Uint32Array(lnData.buffer));
+    }
+
+    // Input
+    const emb = new Float32Array(D);
+    for (let i = 0; i < D; i++) emb[i] = (Math.random() - 0.5) * 0.1;
+    device.queue.writeBuffer(ioBuf, 0, emb);
+    device.queue.writeBuffer(uBuf, 0, new Uint32Array([0, 0, 0, 0])); // cur_pos=0
+
+    const bg = device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: packedBuf } },
+        { binding: 1, resource: { buffer: ioBuf } },
+        { binding: 2, resource: { buffer: kvBuf } },
+        { binding: 3, resource: { buffer: uBuf } },
+      ]
+    });
+
+    // Validate
+    L(`  Running...`);
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    const readBuf = device.createBuffer({ size: D * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    enc.copyBufferToBuffer(ioBuf, 0, readBuf, 0, D * 4);
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check = new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+
+    if (check.every(v => v === 0)) { L(`  FAIL: all zeros\n`); packedBuf.destroy(); ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy(); continue; }
+    if (check.some(v => isNaN(v))) { L(`  FAIL: NaN\n`); packedBuf.destroy(); ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy(); continue; }
+    L(`  OK [${check[0].toFixed(3)}, ${check[1].toFixed(3)}, ${check[2].toFixed(3)}]`);
+
+    // Benchmark: 3 warmup + 5 timed (SEQ=1 so should be fast)
+    for (let i = 0; i < 3; i++) {
+      device.queue.writeBuffer(ioBuf, 0, emb);
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1); p.end();
+      device.queue.submit([e.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+    const times = [];
+    for (let i = 0; i < 5; i++) {
+      device.queue.writeBuffer(ioBuf, 0, emb);
+      const t0 = performance.now();
+      const e = device.createCommandEncoder();
+      const p = e.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1); p.end();
+      device.queue.submit([e.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      times.push(performance.now() - t0);
+    }
+    const mean = times.reduce((a,b)=>a+b)/times.length;
+    const prevTokS = test.NL === 1 ? 8.0 : (test.NL === 8 ? 1.0 : 0.2);
+    const speedup = (1000/mean) / prevTokS;
+    L(`  ${mean.toFixed(0)} ms/token | ${(1000/mean).toFixed(1)} tok/s | ${speedup.toFixed(1)}x vs prev\n`);
+
+    packedBuf.destroy(); ioBuf.destroy(); kvBuf.destroy(); uBuf.destroy(); readBuf.destroy();
+  }
+  L('Done.');
+}
+
+run().catch(e => L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>

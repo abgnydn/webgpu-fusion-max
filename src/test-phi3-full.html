@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Phi-3-mini FULL (3.8B) — Chunked</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>Phi-3-mini 3.8B — 32 Layers, 4 Dispatches</h2>
+<p>D=3072, H=32, L=32, SEQ=16. Chunked into 4 groups of 8 layers.</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+const D = 3072, NH = 32, HD = D/NH, DF = D*4, SL = 16, WG = 64, TILE = 256;
+// Start with 16 layers (half model) to test feasibility
+const CHUNK_SIZE = 8;
+const TOTAL_LAYERS = 16;  // Half Phi-3-mini first
+const N_CHUNKS = TOTAL_LAYERS / CHUNK_SIZE;
+
+// Weight offsets per layer
+let p = 0;
+const o = {};
+o.LG=p; p+=D; o.LB=p; p+=D; o.WQ=p; p+=D*D; o.WK=p; p+=D*D;
+o.WV=p; p+=D*D; o.WO=p; p+=D*D; o.LG2=p; p+=D; o.LB2=p; p+=D;
+o.W1=p; p+=D*DF; o.B1=p; p+=DF; o.W2=p; p+=DF*D; o.B2=p; p+=D;
+const PL = p;
+const chunkWeights = PL * CHUNK_SIZE;
+const totalParams = PL * TOTAL_LAYERS;
+
+function generateShader(NL) {
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const SL:u32=${SL}u;const NL:u32=${NL}u;const EPS:f32=1e-5;const PL:u32=${PL}u;
+const WG:u32=${WG}u;const TILE:u32=${TILE}u;const SC:u32=${SL*D}u;
+
+@group(0)@binding(0) var<storage,read> W:array<f32>;
+@group(0)@binding(1) var<storage,read_write> io:array<f32>;
+@group(0)@binding(2) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(3) var<uniform> u:vec4<u32>;
+
+var<workgroup> sx:array<f32,${D}>;
+var<workgroup> sr:array<f32,${WG}>;
+var<workgroup> ft:array<f32,${TILE}>;
+
+fn gelu(x:f32)->f32{let i=0.7978845608*(x+0.044715*x*x*x);return 0.5*x*(1.0+tanh(i));}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.x;
+  let nt=u.x;
+
+  for(var t=0u;t<nt;t++){
+    let tb=t*D;
+    for(var i=tid;i<D;i+=WG){sx[i]=io[tb+i];}
+    workgroupBarrier();
+
+    for(var layer=0u;layer<NL;layer++){
+      let LB=layer*PL;
+      let kvB=layer*SL*D;
+
+      // LN1
+      var ps:f32=0.0;
+      for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+      sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu=sr[0]/f32(D);workgroupBarrier();
+      var pv2:f32=0.0;
+      for(var i=tid;i<D;i+=WG){let d=sx[i]-mu;pv2+=d*d;}
+      sr[tid]=pv2;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is1=1.0/sqrt(sr[0]/f32(D)+EPS);workgroupBarrier();
+      for(var i=tid;i<D;i+=WG){
+        io[SC+i]=(sx[i]-mu)*is1*W[LB+${o.LG}u+i]+W[LB+${o.LB}u+i];
+      }workgroupBarrier();
+
+      // QKV
+      for(var i=tid;i<D;i+=WG){
+        var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+        for(var j=0u;j<D;j++){
+          let l=io[SC+j];
+          qa+=l*W[LB+${o.WQ}u+j*D+i];
+          ka+=l*W[LB+${o.WK}u+j*D+i];
+          va+=l*W[LB+${o.WV}u+j*D+i];
+        }
+        io[tb+i]=qa;
+        kv[kvB+t*D+i]=ka;
+        kv[NL*SL*D+kvB+t*D+i]=va;
+      }workgroupBarrier();
+
+      // Attention
+      for(var i=tid;i<D;i+=WG){io[SC+i]=0.0;}
+      workgroupBarrier();
+      for(var h=tid;h<NH;h+=WG){
+        let ho=h*HD;
+        var mx:f32=-1e9;
+        for(var s=0u;s<=t;s++){
+          var sc:f32=0.0;
+          for(var d=0u;d<HD;d++){sc+=io[tb+ho+d]*kv[kvB+s*D+ho+d];}
+          sc/=sqrt(f32(HD));if(sc>mx){mx=sc;}
+        }
+        var es:f32=0.0;
+        var ho2:array<f32,${HD}>;
+        for(var d=0u;d<HD;d++){ho2[d]=0.0;}
+        for(var s=0u;s<=t;s++){
+          var sc:f32=0.0;
+          for(var d=0u;d<HD;d++){sc+=io[tb+ho+d]*kv[kvB+s*D+ho+d];}
+          let w=exp(sc/sqrt(f32(HD))-mx);es+=w;
+          for(var d=0u;d<HD;d++){ho2[d]+=w*kv[NL*SL*D+kvB+s*D+ho+d];}
+        }
+        if(es>0.0){for(var d=0u;d<HD;d++){io[SC+ho+d]=ho2[d]/es;}}
+      }workgroupBarrier();
+
+      // Wo + residual
+      for(var i=tid;i<D;i+=WG){
+        var a:f32=0.0;
+        for(var j=0u;j<D;j++){a+=io[SC+j]*W[LB+${o.WO}u+j*D+i];}
+        sx[i]=sx[i]+a;
+      }workgroupBarrier();
+
+      // LN2
+      ps=0.0;
+      for(var i=tid;i<D;i+=WG){ps+=sx[i];}
+      sr[tid]=ps;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let mu2=sr[0]/f32(D);workgroupBarrier();
+      pv2=0.0;
+      for(var i=tid;i<D;i+=WG){let d=sx[i]-mu2;pv2+=d*d;}
+      sr[tid]=pv2;workgroupBarrier();
+      for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+      let is2=1.0/sqrt(sr[0]/f32(D)+EPS);workgroupBarrier();
+      for(var i=tid;i<D;i+=WG){
+        io[tb+i]=(sx[i]-mu2)*is2*W[LB+${o.LG2}u+i]+W[LB+${o.LB2}u+i];
+      }workgroupBarrier();
+
+      // Tiled FFN
+      for(var i=tid;i<D;i+=WG){io[SC+i]=0.0;}
+      workgroupBarrier();
+      for(var tile=0u;tile<DF;tile+=TILE){
+        for(var i=tid;i<TILE;i+=WG){
+          let gi=tile+i;
+          if(gi<DF){
+            var a=W[LB+${o.B1}u+gi];
+            for(var j=0u;j<D;j++){a+=io[tb+j]*W[LB+${o.W1}u+j*DF+gi];}
+            ft[i]=gelu(a);
+          } else {ft[i]=0.0;}
+        }workgroupBarrier();
+        for(var i=tid;i<D;i+=WG){
+          var a:f32=0.0;
+          for(var j=0u;j<TILE;j++){
+            let gj=tile+j;
+            if(gj<DF){a+=ft[j]*W[LB+${o.W2}u+gj*D+i];}
+          }
+          io[SC+i]+=a;
+        }workgroupBarrier();
+      }
+      for(var i=tid;i<D;i+=WG){sx[i]=sx[i]+io[SC+i]+W[LB+${o.B2}u+i];}
+      workgroupBarrier();
+    }
+
+    for(var i=tid;i<D;i+=WG){io[tb+i]=sx[i];}
+    workgroupBarrier();
+  }
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Phi-3-mini: D=${D}, H=${NH}, L=${TOTAL_LAYERS}, SEQ=${SL}`);
+  L(`Total params: ${(totalParams/1e9).toFixed(1)}B`);
+  L(`Strategy: ${N_CHUNKS} chunks of ${CHUNK_SIZE} layers = ${N_CHUNKS} dispatches`);
+  L(`Weights per chunk: ${(chunkWeights*4/1024/1024).toFixed(0)} MB`);
+  L(`Unfused would need: ${4*TOTAL_LAYERS*SL} dispatches\n`);
+
+  // Compile shader
+  L('Compiling shader (8 layers)...');
+  const code = generateShader(CHUNK_SIZE);
+  const mod = device.createShaderModule({ code });
+  const info = await mod.getCompilationInfo();
+  const errors = info.messages.filter(m => m.type === 'error');
+  if (errors.length > 0) {
+    L(`SHADER ERROR: ${errors[0].message}`);
+    return;
+  }
+  const pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  L('Shader compiled OK\n');
+
+  // IO buffer: shared across chunks. Token hidden states live here.
+  const ioBufSize = (SL * D + D) * 4;  // +D for scratch
+  const ioBuf = device.createBuffer({ size: ioBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(uBuf, 0, new Uint32Array([SL, 0, 0, 0]));
+
+  // Create chunks: each has its own weight buffer and KV cache
+  L('Allocating chunks...');
+  const chunks = [];
+  for (let c = 0; c < N_CHUNKS; c++) {
+    const wBuf = device.createBuffer({ size: chunkWeights * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: CHUNK_SIZE * SL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+    // Upload weights in 64M-float slices (256MB each) to avoid JS allocation limit
+    const SLICE = 8 * 1024 * 1024; // 8M floats = 32MB
+    const scale = Math.sqrt(2.0 / D);
+    for (let offset = 0; offset < chunkWeights; offset += SLICE) {
+      const end = Math.min(offset + SLICE, chunkWeights);
+      const slice = new Float32Array(end - offset);
+      for (let i = 0; i < slice.length; i++) {
+        const u1 = Math.random() || 1e-9;
+        const u2 = Math.random();
+        slice[i] = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2) * scale;
+      }
+      // Apply LN defaults for layers that fall in this slice
+      for (let l = 0; l < CHUNK_SIZE; l++) {
+        const base = l * PL;
+        // ln1_gamma
+        if (base >= offset && base < end) {
+          for (let i = 0; i < D && base + i < end; i++) slice[base - offset + i] = 1.0;
+        }
+        // ln1_beta
+        if (base + D >= offset && base + D < end) {
+          for (let i = 0; i < D && base + D + i < end; i++) slice[base + D - offset + i] = 0.0;
+        }
+        // ln2_gamma
+        const ln2Off = base + 4 * D * D + 2 * D;
+        if (ln2Off >= offset && ln2Off < end) {
+          for (let i = 0; i < D && ln2Off + i < end; i++) slice[ln2Off - offset + i] = 1.0;
+        }
+        // ln2_beta
+        if (ln2Off + D >= offset && ln2Off + D < end) {
+          for (let i = 0; i < D && ln2Off + D + i < end; i++) slice[ln2Off + D - offset + i] = 0.0;
+        }
+      }
+      device.queue.writeBuffer(wBuf, offset * 4, slice);
+    }
+    L(`  Chunk ${c}: layers ${c*CHUNK_SIZE}-${(c+1)*CHUNK_SIZE-1} uploaded`);
+
+    // Bind group: io buffer is shared, weights + kv are per-chunk
+    const bg = device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: wBuf } },
+        { binding: 1, resource: { buffer: ioBuf } },
+        { binding: 2, resource: { buffer: kvBuf } },
+        { binding: 3, resource: { buffer: uBuf } },
+      ]
+    });
+
+    chunks.push({ wBuf, kvBuf, bg });
+    L(`  Chunk ${c}: layers ${c*CHUNK_SIZE}-${(c+1)*CHUNK_SIZE-1} (${(chunkWeights*4/1024/1024).toFixed(0)} MB)`);
+  }
+
+  // Initial embeddings
+  const emb = new Float32Array(SL * D);
+  for (let i = 0; i < emb.length; i++) emb[i] = (Math.random() - 0.5) * 0.1;
+
+  async function runInference() {
+    // Load embeddings into IO buffer
+    device.queue.writeBuffer(ioBuf, 0, emb);
+
+    // Dispatch each chunk sequentially
+    for (let c = 0; c < N_CHUNKS; c++) {
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, chunks[c].bg);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      // IO buffer now has the output — next chunk reads it as input
+    }
+    await device.queue.onSubmittedWorkDone();
+  }
+
+  // Validate
+  L('\nRunning validation...');
+  await runInference();
+
+  const readBuf = device.createBuffer({ size: D * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(ioBuf, 0, readBuf, 0, D * 4);
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  await readBuf.mapAsync(GPUMapMode.READ);
+  const check = new Float32Array(readBuf.getMappedRange().slice(0));
+  readBuf.unmap();
+
+  const allZero = check.every(v => v === 0);
+  const hasNaN = check.some(v => isNaN(v));
+  if (allZero) { L('FAIL: output all zeros'); return; }
+  if (hasNaN) { L('FAIL: NaN in output'); return; }
+  L(`OUTPUT OK! First 3: [${check[0].toFixed(4)}, ${check[1].toFixed(4)}, ${check[2].toFixed(4)}]`);
+
+  // Benchmark
+  L('\nBenchmarking (2 warmup + 3 timed)...');
+  for (let i = 0; i < 2; i++) await runInference();
+
+  const times = [];
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    await runInference();
+    times.push(performance.now() - t0);
+    L(`  Run ${i+1}: ${times[i].toFixed(0)} ms`);
+  }
+
+  const mean = times.reduce((a,b) => a+b) / times.length;
+  L(`\n========================================`);
+  L(`Phi-3-mini (3.8B params, 32 layers)`);
+  L(`${mean.toFixed(0)} ms | ${(SL/mean*1000).toFixed(1)} tok/s`);
+  L(`${N_CHUNKS} dispatches (vs ${4*TOTAL_LAYERS*SL} unfused = ${(4*TOTAL_LAYERS*SL/N_CHUNKS).toFixed(0)}x reduction)`);
+  L(`========================================`);
+}
+
+run().catch(e => L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>

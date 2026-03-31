@@ -1,0 +1,12 @@
+{
+  "name": "webgpu-fusion-max",
+  "version": "0.1.0",
+  "description": "Maximum model size fused transformer kernels — tiled FFN, tiled attention",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "^6.3.0"
+  }
+}

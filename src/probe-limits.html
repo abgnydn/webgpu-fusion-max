@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html><head><title>GPU Limits Probe</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>WebGPU Limits Probe</h2>
+<pre id="log">Probing...</pre>
+<script>
+async function probe() {
+  const el = document.getElementById('log'); el.textContent = '';
+  const L = msg => el.textContent += msg + '\n';
+
+  if (!navigator.gpu) { L('No WebGPU'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const info = adapter.info || {};
+  L(`GPU: ${info.vendor} ${info.architecture} — ${info.device || ''}`);
+  L(`f16: ${adapter.features.has('shader-f16')}`);
+  L(`subgroups: ${adapter.features.has('subgroups')}`);
+  L('');
+
+  const limits = adapter.limits;
+  L('=== LIMITS ===');
+  L(`maxStorageBufferBindingSize: ${(limits.maxStorageBufferBindingSize / 1024 / 1024).toFixed(0)} MB`);
+  L(`maxBufferSize:               ${(limits.maxBufferSize / 1024 / 1024).toFixed(0)} MB`);
+  L(`maxComputeWorkgroupStorageSize: ${limits.maxComputeWorkgroupStorageSize} bytes (${(limits.maxComputeWorkgroupStorageSize / 1024).toFixed(1)} KB)`);
+  L(`maxComputeWorkgroupSizeX:    ${limits.maxComputeWorkgroupSizeX}`);
+  L(`maxComputeWorkgroupSizeY:    ${limits.maxComputeWorkgroupSizeY}`);
+  L(`maxComputeWorkgroupSizeZ:    ${limits.maxComputeWorkgroupSizeZ}`);
+  L(`maxComputeInvocationsPerWorkgroup: ${limits.maxComputeInvocationsPerWorkgroup}`);
+  L(`maxComputeWorkgroupsPerDimension:  ${limits.maxComputeWorkgroupsPerDimension}`);
+  L(`maxStorageBuffersPerShaderStage:    ${limits.maxStorageBuffersPerShaderStage}`);
+  L(`maxBindGroups:               ${limits.maxBindGroups}`);
+  L('');
+
+  // Calculate max D for each approach
+  const sharedMem = limits.maxComputeWorkgroupStorageSize;
+  L('=== MAX MODEL SIZE ANALYSIS ===');
+  L(`Available shared memory: ${sharedMem} bytes (${(sharedMem/1024).toFixed(1)} KB)`);
+  L('');
+
+  // Current parallel kernel: shared_x(D) + shared_buf(max(D,4D)) + shared_reduce(WG) = 5D + WG
+  L('Current parallel kernel (no tiling):');
+  for (const D of [128, 256, 512, 768, 1024, 2048, 4096]) {
+    const DF = D * 4;
+    const need = (D + Math.max(D, DF) + 64) * 4;
+    const fits = need <= sharedMem;
+    L(`  D=${D.toString().padStart(4)} FFN=${DF.toString().padStart(5)} → ${(need/1024).toFixed(1).padStart(5)} KB ${fits ? '✓' : '✗ TOO BIG'}`);
+  }
+  L('');
+
+  // Tiled FFN: shared_x(D) + shared_tile(TILE) + shared_reduce(WG) = D + TILE + WG
+  L('Tiled FFN (tile=256):');
+  const TILE = 256;
+  for (const D of [128, 256, 512, 768, 1024, 2048, 4096, 8192]) {
+    const need = (D + TILE + 64) * 4;
+    const fits = need <= sharedMem;
+    L(`  D=${D.toString().padStart(4)} → ${(need/1024).toFixed(1).padStart(5)} KB ${fits ? '✓' : '✗ TOO BIG'}`);
+  }
+  L('');
+
+  // Tiled FFN + tiled attention: shared_x(D) + shared_tile(TILE) + shared_reduce(WG)
+  // Attention tile: only need TILE K/V values at a time
+  L('Fully tiled (FFN tile=256, attn tile=64):');
+  const ATILE = 64;
+  for (const D of [128, 256, 512, 768, 1024, 2048, 4096, 8192]) {
+    const need = (D + Math.max(TILE, ATILE) + 64) * 4;
+    const fits = need <= sharedMem;
+    L(`  D=${D.toString().padStart(4)} → ${(need/1024).toFixed(1).padStart(5)} KB ${fits ? '✓' : '✗ TOO BIG'}`);
+  }
+  L('');
+
+  // Weight buffer sizes
+  L('=== WEIGHT BUFFER SIZES ===');
+  const maxBuf = limits.maxStorageBufferBindingSize;
+  for (const D of [768, 1024, 2048, 4096]) {
+    const DF = D * 4;
+    const perLayer = 4*D + 4*D*D + 2*D*DF + DF + D;
+    for (const NL of [1, 4, 12, 24]) {
+      const total = perLayer * NL * 4; // bytes
+      const fits = total <= maxBuf;
+      const mb = (total / 1024 / 1024).toFixed(1);
+      L(`  D=${D.toString().padStart(4)} L=${NL.toString().padStart(2)} → ${mb.padStart(7)} MB ${fits ? '✓' : '✗ EXCEEDS BUFFER'}`);
+    }
+  }
+}
+probe();
+</script></body></html>

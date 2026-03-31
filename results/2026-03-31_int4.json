@@ -1,0 +1,15 @@
+{
+  "date": "2026-03-31",
+  "gpu": "Apple M2 Pro (19-core, Metal-3)",
+  "browser": "Chrome 123+",
+  "quantization": "int4 (group_size=32, symmetric)",
+  "seq_len": 16,
+  "workgroup_size": 64,
+  "results": [
+    { "model": "Qwen2-0.5B", "d": 896, "heads": 14, "layers": 1, "weights_mb": 6, "ms": 156, "tok_s": 102.6 },
+    { "model": "Qwen2-0.5B", "d": 896, "heads": 14, "layers": 24, "weights_mb": 139, "ms": 4192, "tok_s": 3.8 },
+    { "model": "Phi-3-mini", "d": 3072, "heads": 32, "layers": 1, "weights_mb": 68, "ms": 1996, "tok_s": 8.0 },
+    { "model": "Phi-3-mini", "d": 3072, "heads": 32, "layers": 8, "weights_mb": 541, "ms": 16167, "tok_s": 1.0 },
+    { "model": "Phi-3-mini", "d": 3072, "heads": 32, "layers": 32, "weights_mb": 2163, "ms": 64598, "tok_s": 0.2 }
+  ]
+}

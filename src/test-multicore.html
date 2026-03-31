@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Multi-Core Phi-3-mini</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>Multi-Core: Split Matmul Across GPU Cores</h2>
+<p>Multiple workgroups each handle a slice of the output dimension.</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+const D = 3072, NH = 32, HD = D/NH, DF = D*4, TILE = 256, GS = 32;
+
+const projParams = 4*D*D + 2*D*DF;
+const packedU32s = projParams / 8;
+const nGroups = projParams / GS;
+const lnParams = 4*D + DF + D;
+
+const wqOff = 0, wkOff = D*D, wvOff = 2*D*D, woOff = 3*D*D;
+const w1Off = 4*D*D, w2Off = 4*D*D + D*DF;
+const lg1 = 0, lb1 = D, lg2 = 2*D, lb2 = 3*D, b1 = 4*D, b2 = 4*D + DF;
+
+// Dequant shader (same as before)
+function genDequantShader() {
+  return `
+const TOTAL:u32=${projParams}u;const GS:u32=${GS}u;
+@group(0)@binding(0) var<storage,read> packed:array<u32>;
+@group(0)@binding(1) var<storage,read> scales:array<f32>;
+@group(0)@binding(2) var<storage,read_write> out:array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let idx=gid.x;if(idx>=TOTAL){return;}
+  let val=(packed[idx/8u]>>((idx%8u)*4u))&0xFu;
+  out[idx]=(f32(val)-8.0)*scales[idx/GS];
+}`;
+}
+
+// Multi-core matmul compute shader
+// Key idea: dispatch N_WG workgroups for matmuls
+// Each workgroup handles D/N_WG output elements
+// LN reductions still need all threads → use io buffer for cross-WG sync
+function genMultiCoreShader(NL, WG, N_WG) {
+  // Each WG handles a slice: [wg_id * slice_size .. (wg_id+1) * slice_size)
+  const sliceD = Math.ceil(D / N_WG);
+  const sliceDF = Math.ceil(DF / N_WG);
+
+  return `
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const NL:u32=${NL}u;const EPS:f32=1e-5;const WG:u32=${WG}u;const TILE:u32=${TILE}u;
+const PP:u32=${projParams}u;const N_WG:u32=${N_WG}u;
+const SLICE_D:u32=${sliceD}u;const SLICE_DF:u32=${sliceDF}u;
+
+@group(0)@binding(0) var<storage,read> W:array<f32>;
+@group(0)@binding(1) var<storage,read> LN:array<f32>;
+@group(0)@binding(2) var<storage,read_write> io:array<f32>;
+// io layout: [0..D) = input/output x
+//            [D..2D) = scratch (ln output, attn output)
+//            [2D..2D+D) = partial sums for LN reduction (per WG)
+//            [3D..3D+DF) = FFN hidden buffer
+@group(0)@binding(3) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(4) var<storage,read_write> sync:array<atomic<u32>>; // cross-WG barrier
+@group(0)@binding(5) var<uniform> u:vec4<u32>;
+
+var<workgroup> sr:array<f32,${WG}>;
+var<workgroup> ft:array<f32,${TILE}>;
+
+fn gelu(x:f32)->f32{let c=clamp(x,-20.0,20.0);let i=0.7978845608*(c+0.044715*c*c*c);return 0.5*c*(1.0+tanh(i));}
+
+fn wg_reduce(tid:u32,val:f32)->f32{
+  sr[tid]=val;workgroupBarrier();
+  for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+  let r=sr[0];workgroupBarrier();return r;
+}
+
+// Cross-workgroup barrier using atomics
+// Each WG increments counter, then spins until all WGs have arrived
+fn cross_wg_barrier(wg_id:u32,tid:u32,barrier_id:u32){
+  if(tid==0u){atomicAdd(&sync[barrier_id],1u);}
+  // All threads in this WG wait for the atomic
+  workgroupBarrier();
+  if(tid==0u){
+    for(var spin=0u;spin<1000000u;spin++){
+      if(atomicLoad(&sync[barrier_id])>=N_WG){break;}
+    }
+  }
+  workgroupBarrier();
+}
+
+@compute @workgroup_size(${WG})
+fn main(
+  @builtin(local_invocation_id) lid:vec3<u32>,
+  @builtin(workgroup_id) wid:vec3<u32>
+){
+  let tid=lid.x;
+  let wg_id=wid.x;
+  let layer_off=u.y;
+
+  // My slice of D
+  let my_start = wg_id * SLICE_D;
+  let my_end = min(my_start + SLICE_D, D);
+
+  // All WGs load their slice of x
+  for(var i=my_start+tid;i<my_end;i+=WG){
+    io[4u*D+i]=io[i];  // copy x to working area
+  }
+  cross_wg_barrier(wg_id,tid,0u);
+
+  var barrier_cnt=1u;
+
+  for(var ll=0u;ll<NL;ll++){
+    let layer=layer_off+ll;
+    let WB=layer*PP;
+    let LB=layer*${lnParams}u;
+    let kvB=layer*D*2u;
+
+    // === LN1: each WG computes partial sum over its slice ===
+    var ps=0.0;
+    for(var i=my_start+tid;i<my_end;i+=WG){ps+=io[4u*D+i];}
+    let local_sum=wg_reduce(tid,ps);
+    // Store partial sum
+    if(tid==0u){io[2u*D+wg_id]=local_sum;}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // WG 0 computes global mean
+    var mu:f32=0.0;
+    if(wg_id==0u && tid==0u){
+      var total=0.0;for(var w=0u;w<N_WG;w++){total+=io[2u*D+w];}
+      io[3u*D]=total/f32(D); // store mean
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    mu=io[3u*D];
+
+    var pv=0.0;
+    for(var i=my_start+tid;i<my_end;i+=WG){let d=io[4u*D+i]-mu;pv+=d*d;}
+    let local_var=wg_reduce(tid,pv);
+    if(tid==0u){io[2u*D+wg_id]=local_var;}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    if(wg_id==0u && tid==0u){
+      var total=0.0;for(var w=0u;w<N_WG;w++){total+=io[2u*D+w];}
+      io[3u*D]=min(1.0/sqrt(total/f32(D)+EPS),1e4);
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    let is1=io[3u*D];
+
+    // LN1 output → io[D+...]
+    for(var i=my_start+tid;i<my_end;i+=WG){
+      io[D+i]=(io[4u*D+i]-mu)*is1*LN[LB+${lg1}u+i]+LN[LB+${lb1}u+i];
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // === QKV: each WG computes its slice of output ===
+    for(var i=my_start+tid;i<my_end;i+=WG){
+      var qa:f32=0.0;var ka:f32=0.0;var va:f32=0.0;
+      for(var j=0u;j<D;j++){
+        let l=io[D+j];
+        qa+=l*W[WB+${wqOff}u+j*D+i];
+        ka+=l*W[WB+${wkOff}u+j*D+i];
+        va+=l*W[WB+${wvOff}u+j*D+i];
+      }
+      io[i]=qa;kv[kvB+i]=ka;kv[kvB+D+i]=va;
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // === Attention (single token) ===
+    // Each WG handles its heads
+    let heads_per_wg = NH / N_WG;
+    let my_h_start = wg_id * heads_per_wg;
+    let my_h_end = min(my_h_start + heads_per_wg, NH);
+    for(var h=my_h_start+tid;h<my_h_end;h+=WG){
+      let ho=h*HD;
+      for(var d=0u;d<HD;d++){io[D+ho+d]=kv[kvB+D+ho+d];}
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // === Wo: each WG computes its slice ===
+    for(var i=my_start+tid;i<my_end;i+=WG){
+      var a:f32=0.0;
+      for(var j=0u;j<D;j++){a+=io[D+j]*W[WB+${woOff}u+j*D+i];}
+      io[4u*D+i]+=a; // residual into working area
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // === LN2 ===
+    ps=0.0;for(var i=my_start+tid;i<my_end;i+=WG){ps+=io[4u*D+i];}
+    let ls2=wg_reduce(tid,ps);
+    if(tid==0u){io[2u*D+wg_id]=ls2;}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    if(wg_id==0u && tid==0u){var t=0.0;for(var w=0u;w<N_WG;w++){t+=io[2u*D+w];}io[3u*D]=t/f32(D);}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    let mu2=io[3u*D];
+    pv=0.0;for(var i=my_start+tid;i<my_end;i+=WG){let d=io[4u*D+i]-mu2;pv+=d*d;}
+    let lv2=wg_reduce(tid,pv);
+    if(tid==0u){io[2u*D+wg_id]=lv2;}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    if(wg_id==0u && tid==0u){var t=0.0;for(var w=0u;w<N_WG;w++){t+=io[2u*D+w];}io[3u*D]=min(1.0/sqrt(t/f32(D)+EPS),1e4);}
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+    let is2=io[3u*D];
+    for(var i=my_start+tid;i<my_end;i+=WG){
+      io[i]=(io[4u*D+i]-mu2)*is2*LN[LB+${lg2}u+i]+LN[LB+${lb2}u+i];
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // === FFN: each WG computes its slice of FFN up, then down ===
+    // Up-projection: each WG does its slice of DF
+    let my_df_start = wg_id * SLICE_DF;
+    let my_df_end = min(my_df_start + SLICE_DF, DF);
+
+    for(var gi=my_df_start+tid;gi<my_df_end;gi+=WG){
+      var a=LN[LB+${b1}u+gi];
+      for(var j=0u;j<D;j++){a+=io[j]*W[WB+${w1Off}u+j*DF+gi];}
+      io[3u*D+gi]=gelu(a);  // store in scratch
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+
+    // Down-projection: each WG does its slice of D
+    for(var i=my_start+tid;i<my_end;i+=WG){
+      var a:f32=0.0;
+      for(var j=0u;j<DF;j++){a+=io[3u*D+j]*W[WB+${w2Off}u+j*D+i];}
+      io[4u*D+i]+=a+LN[LB+${b2}u+i];
+    }
+    cross_wg_barrier(wg_id,tid,barrier_cnt);barrier_cnt+=1u;
+  }
+
+  // Write output
+  for(var i=my_start+tid;i<my_end;i+=WG){io[i]=io[4u*D+i];}
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Max WG invocations: ${adapter.limits.maxComputeInvocationsPerWorkgroup}\n`);
+
+  const xavierScale = 1.0 / (Math.sqrt(D) * 4.6);
+
+  // Dequant shader
+  const dqCode = genDequantShader();
+  const dqPipe = device.createComputePipeline({ layout:'auto', compute:{ module:device.createShaderModule({code:dqCode}), entryPoint:'main' }});
+
+  const tests = [
+    { NL:1, WG:256, N_WG:1,  label:'1L WG=256 ×1 (baseline)' },
+    { NL:1, WG:256, N_WG:4,  label:'1L WG=256 ×4 (4 cores)' },
+    { NL:1, WG:256, N_WG:8,  label:'1L WG=256 ×8 (8 cores)' },
+    { NL:1, WG:256, N_WG:12, label:'1L WG=256 ×12 (12 cores)' },
+    { NL:8, WG:256, N_WG:12, label:'8L WG=256 ×12' },
+  ];
+
+  for (const test of tests) {
+    const { NL, WG, N_WG, label } = test;
+    L(`--- ${label} ---`);
+
+    // Check shared memory
+    const sharedBytes = (WG + TILE) * 4;
+    L(`  Shared: ${(sharedBytes/1024).toFixed(1)}KB | ${N_WG} workgroups × ${WG} threads = ${N_WG*WG} total`);
+
+    // Compile
+    const code = genMultiCoreShader(NL, WG, N_WG);
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errors = info.messages.filter(m => m.type === 'error');
+    if (errors.length > 0) {
+      L(`  SHADER ERROR: ${errors[0].message}\n`);
+      continue;
+    }
+    const pipe = device.createComputePipeline({ layout:'auto', compute:{ module:mod, entryPoint:'main' }});
+    L(`  Compiled OK`);
+
+    // Buffers
+    const dqSize = projParams * NL;
+    const dqBuf = device.createBuffer({ size: dqSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const lnBuf = device.createBuffer({ size: lnParams * NL * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    // io needs: D(x) + D(scratch) + D(partial sums) + D(global reduce) + DF(FFN hidden) + D(working x)
+    const ioSize = 5 * D + DF;
+    const ioBuf = device.createBuffer({ size: ioSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: NL * D * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const syncBuf = device.createBuffer({ size: 1024 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); // atomic counters
+    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    // Upload + dequant
+    L(`  Uploading + dequanting...`);
+    for (let l = 0; l < NL; l++) {
+      const pBuf = device.createBuffer({ size: packedU32s*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const sBuf = device.createBuffer({ size: nGroups*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const CHUNK=1024*1024;
+      for(let off=0;off<packedU32s;off+=CHUNK){
+        const end=Math.min(off+CHUNK,packedU32s);
+        const sl=new Uint32Array(end-off);
+        for(let i=0;i<sl.length;i++){let v=0;for(let b=0;b<8;b++)v|=(Math.floor(Math.random()*16)<<(b*4));sl[i]=v;}
+        device.queue.writeBuffer(pBuf,off*4,sl);
+      }
+      const sc=new Float32Array(nGroups);
+      for(let i=0;i<sc.length;i++)sc[i]=xavierScale*(Math.random()*0.3+0.85);
+      device.queue.writeBuffer(sBuf,0,new Uint32Array(sc.buffer));
+      const ln=new Float32Array(lnParams);
+      for(let i=0;i<D;i++){ln[i]=1;ln[2*D+i]=1;}
+      device.queue.writeBuffer(lnBuf,l*lnParams*4,new Uint32Array(ln.buffer));
+
+      const bg=device.createBindGroup({layout:dqPipe.getBindGroupLayout(0),entries:[
+        {binding:0,resource:{buffer:pBuf}},{binding:1,resource:{buffer:sBuf}},
+        {binding:2,resource:{buffer:dqBuf,offset:l*projParams*4,size:projParams*4}},
+      ]});
+      const enc=device.createCommandEncoder();
+      const pass=enc.beginComputePass();pass.setPipeline(dqPipe);pass.setBindGroup(0,bg);
+      pass.dispatchWorkgroups(Math.ceil(projParams/256));pass.end();
+      device.queue.submit([enc.finish()]);
+      pBuf.destroy();sBuf.destroy();
+    }
+    await device.queue.onSubmittedWorkDone();
+
+    const emb=new Float32Array(D);
+    for(let i=0;i<D;i++)emb[i]=(Math.random()-0.5)*0.1;
+
+    async function runInference(){
+      device.queue.writeBuffer(ioBuf,0,emb);
+      device.queue.writeBuffer(uBuf,0,new Uint32Array([0,0,0,0]));
+      // Reset sync counters
+      device.queue.writeBuffer(syncBuf,0,new Uint32Array(1024));
+
+      const bg=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[
+        {binding:0,resource:{buffer:dqBuf}},{binding:1,resource:{buffer:lnBuf}},
+        {binding:2,resource:{buffer:ioBuf}},{binding:3,resource:{buffer:kvBuf}},
+        {binding:4,resource:{buffer:syncBuf}},{binding:5,resource:{buffer:uBuf}},
+      ]});
+      const enc=device.createCommandEncoder();
+      const pass=enc.beginComputePass();
+      pass.setPipeline(pipe);pass.setBindGroup(0,bg);
+      pass.dispatchWorkgroups(N_WG);  // MULTIPLE workgroups!
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      await device.queue.onSubmittedWorkDone();
+    }
+
+    // Validate
+    L(`  Running...`);
+    await runInference();
+    const readBuf=device.createBuffer({size:D*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+    const rEnc=device.createCommandEncoder();
+    rEnc.copyBufferToBuffer(ioBuf,0,readBuf,0,D*4);
+    device.queue.submit([rEnc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check=new Float32Array(readBuf.getMappedRange().slice(0));
+    readBuf.unmap();
+
+    if(check.every(v=>v===0)){L(`  FAIL: zeros\n`);continue;}
+    if(check.some(v=>isNaN(v))){L(`  FAIL: NaN\n`);continue;}
+    L(`  OK [${check[0].toFixed(3)}, ${check[1].toFixed(3)}]`);
+
+    // Benchmark
+    for(let i=0;i<3;i++)await runInference();
+    const times=[];
+    for(let i=0;i<5;i++){
+      const t0=performance.now();
+      await runInference();
+      times.push(performance.now()-t0);
+    }
+    const mean=times.reduce((a,b)=>a+b)/times.length;
+    L(`  ${mean.toFixed(0)} ms/token | ${(1000/mean).toFixed(1)} tok/s\n`);
+
+    dqBuf.destroy();lnBuf.destroy();ioBuf.destroy();kvBuf.destroy();syncBuf.destroy();uBuf.destroy();readBuf.destroy();
+  }
+
+  L('Done. Baseline (single WG pre-dequant): 1L=30ms, 8L=227ms');
+}
+
+run().catch(e=>L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>

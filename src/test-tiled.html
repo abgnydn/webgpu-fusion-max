@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Tiled Matmul Phi-3-mini</title>
+<style>body{font-family:monospace;background:#0a0a0a;color:#e0e0e0;padding:2rem}pre{background:#111;padding:1rem;border-radius:6px;line-height:1.8}</style>
+</head><body>
+<h2>Tiled Matmul + Subgroups — Phi-3-mini</h2>
+<p>8×8 register tile per thread. Subgroup reductions for LN. Pre-dequantized f32.</p>
+<pre id="log">Starting...</pre>
+<script type="module">
+const el = document.getElementById('log'); el.textContent = '';
+const L = msg => { el.textContent += msg + '\n'; el.scrollTop = el.scrollHeight; };
+
+const D = 3072, NH = 32, HD = D/NH, DF = D*4, GS = 32;
+const projParams = 4*D*D + 2*D*DF;
+const packedU32s = projParams / 8;
+const nGroups = projParams / GS;
+const lnParams = 4*D + DF + D;
+const wqOff=0,wkOff=D*D,wvOff=2*D*D,woOff=3*D*D,w1Off=4*D*D,w2Off=4*D*D+D*DF;
+const lg1=0,lb1=D,lg2=2*D,lb2=3*D,b1=4*D,b2=4*D+DF;
+
+function genDequantShader(){return `
+const TOTAL:u32=${projParams}u;const GS:u32=${GS}u;
+@group(0)@binding(0) var<storage,read> packed:array<u32>;
+@group(0)@binding(1) var<storage,read> scales:array<f32>;
+@group(0)@binding(2) var<storage,read_write> out:array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let idx=gid.x;if(idx>=TOTAL){return;}
+  let val=(packed[idx/8u]>>((idx%8u)*4u))&0xFu;
+  out[idx]=(f32(val)-8.0)*scales[idx/GS];
+}`;}
+
+// The key optimization: tiled matmul
+// Instead of each thread computing 1 output element by iterating over D inputs,
+// each thread computes a TILE×TILE block of outputs.
+// With TILE=4 and WG=256, we process 256×4 = 1024 output elements per dispatch iteration.
+//
+// For our fused kernel, the matmul is: out[i] = sum_j(input[j] * W[j*D+i])
+// This is a matrix-vector multiply (input is 1×D, W is D×D, out is 1×D)
+// For mat-vec, the optimization is simpler: each thread computes 4 output elements
+// with the inner loop unrolled.
+
+function genTiledComputeShader(NL, WG, useSubgroups) {
+  // For D=3072, WG=256: each thread handles D/WG = 12 output elements
+  // With 4x unroll: inner loop does 4 iterations per step
+  const ELEMS_PER_THREAD = Math.ceil(D / WG);
+  const TILE = 256; // FFN tile
+
+  // Subgroup size on Apple Silicon = 32
+  const SG_SIZE = 32;
+
+  return `
+${useSubgroups ? 'enable subgroups;' : ''}
+
+const D:u32=${D}u;const NH:u32=${NH}u;const HD:u32=${HD}u;const DF:u32=${DF}u;
+const NL:u32=${NL}u;const EPS:f32=1e-5;const WG:u32=${WG}u;const TILE:u32=${TILE}u;
+const PP:u32=${projParams}u;const EPT:u32=${ELEMS_PER_THREAD}u;
+
+@group(0)@binding(0) var<storage,read> W:array<f32>;
+@group(0)@binding(1) var<storage,read> LN:array<f32>;
+@group(0)@binding(2) var<storage,read_write> io:array<f32>;
+@group(0)@binding(3) var<storage,read_write> kv:array<f32>;
+@group(0)@binding(4) var<uniform> u:vec4<u32>;
+
+// Shared memory: only for FFN tile + LN reduction (if no subgroups)
+${useSubgroups ? '' : `var<workgroup> sr:array<f32,${WG}>;`}
+var<workgroup> ft:array<f32,${TILE}>;
+// Shared input cache for matmul: load input once, all threads read
+var<workgroup> input_cache:array<f32,${D}>;
+
+fn gelu(x:f32)->f32{let c=clamp(x,-20.0,20.0);let i=0.7978845608*(c+0.044715*c*c*c);return 0.5*c*(1.0+tanh(i));}
+
+${useSubgroups ? `
+// Subgroup reduction: no shared memory needed
+fn full_reduce(tid:u32, val:f32)->f32{
+  // First: reduce within subgroup
+  let sg_sum = subgroupAdd(val);
+  // Then: use shared ft buffer (repurposed) to collect subgroup results
+  let sg_id = tid / 32u;
+  let sg_lane = tid % 32u;
+  if(sg_lane == 0u){ ft[sg_id] = sg_sum; }
+  workgroupBarrier();
+  // Reduce across subgroups (WG/32 values)
+  var total = 0.0;
+  if(tid == 0u){
+    for(var i=0u;i<WG/32u;i++){ total += ft[i]; }
+    ft[0] = total;
+  }
+  workgroupBarrier();
+  return ft[0];
+}
+` : `
+fn full_reduce(tid:u32, val:f32)->f32{
+  sr[tid]=val;workgroupBarrier();
+  for(var s=WG/2u;s>0u;s/=2u){if(tid<s){sr[tid]+=sr[tid+s];}workgroupBarrier();}
+  let r=sr[0];workgroupBarrier();return r;
+}
+`}
+
+// Tiled matrix-vector multiply: out[my_start..my_end] = input_cache[] @ W[offset+j*D+i]
+// Each thread computes EPT output elements with 4x unrolled inner loop
+fn matvec_tiled(tid:u32, w_offset:u32, out_offset:u32){
+  let my_start = tid * EPT;
+  for(var ii=0u;ii<EPT;ii++){
+    let i = my_start + ii;
+    if(i >= D){break;}
+    var acc0:f32 = 0.0;
+    var acc1:f32 = 0.0;
+    var acc2:f32 = 0.0;
+    var acc3:f32 = 0.0;
+    // 4x unrolled inner loop
+    var j=0u;
+    for(;j+3u<D;j+=4u){
+      let v0=input_cache[j];let v1=input_cache[j+1u];
+      let v2=input_cache[j+2u];let v3=input_cache[j+3u];
+      acc0+=v0*W[w_offset+j*D+i];
+      acc1+=v1*W[w_offset+(j+1u)*D+i];
+      acc2+=v2*W[w_offset+(j+2u)*D+i];
+      acc3+=v3*W[w_offset+(j+3u)*D+i];
+    }
+    // Remainder
+    for(;j<D;j++){acc0+=input_cache[j]*W[w_offset+j*D+i];}
+    io[out_offset+i]=acc0+acc1+acc2+acc3;
+  }
+}
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let tid=lid.x;
+  let layer_off=u.y;
+
+  // Load initial input into cache
+  for(var i=tid;i<D;i+=WG){input_cache[i]=io[i];}
+  workgroupBarrier();
+
+  // Also keep a local copy for residual
+  var residual:array<f32,${ELEMS_PER_THREAD}>;
+  let my_start = tid * EPT;
+  for(var ii=0u;ii<EPT;ii++){
+    let i=my_start+ii;
+    if(i<D){residual[ii]=input_cache[i];}
+  }
+
+  for(var ll=0u;ll<NL;ll++){
+    let layer=layer_off+ll;
+    let WB=layer*PP;
+    let LB=layer*${lnParams}u;
+    let kvB=layer*D*2u;
+
+    // === LN1 ===
+    var ps=0.0;for(var i=tid;i<D;i+=WG){ps+=input_cache[i];}
+    let mu=full_reduce(tid,ps)/f32(D);
+    var pv=0.0;for(var i=tid;i<D;i+=WG){let d=input_cache[i]-mu;pv+=d*d;}
+    let is1=min(1.0/sqrt(full_reduce(tid,pv)/f32(D)+EPS),1e4);
+    // LN output → io[D+...], then reload into cache
+    for(var i=tid;i<D;i+=WG){
+      io[D+i]=(input_cache[i]-mu)*is1*LN[LB+${lg1}u+i]+LN[LB+${lb1}u+i];
+    }
+    workgroupBarrier();
+    for(var i=tid;i<D;i+=WG){input_cache[i]=io[D+i];}
+    workgroupBarrier();
+
+    // === QKV with tiled matvec ===
+    // Q
+    matvec_tiled(tid, WB+${wqOff}u, 0u);
+    workgroupBarrier();
+
+    // K → kv cache
+    matvec_tiled(tid, WB+${wkOff}u, D);
+    workgroupBarrier();
+    for(var i=tid;i<D;i+=WG){kv[kvB+i]=io[D+i];}
+
+    // V → kv cache
+    matvec_tiled(tid, WB+${wvOff}u, D);
+    workgroupBarrier();
+    for(var i=tid;i<D;i+=WG){kv[kvB+D+i]=io[D+i];}
+    workgroupBarrier();
+
+    // === Attention (single token, pos=0) → output = V ===
+    for(var i=tid;i<D;i+=WG){io[D+i]=kv[kvB+D+i];}
+    workgroupBarrier();
+
+    // === Wo (tiled) ===
+    for(var i=tid;i<D;i+=WG){input_cache[i]=io[D+i];}
+    workgroupBarrier();
+    matvec_tiled(tid, WB+${woOff}u, D);
+    workgroupBarrier();
+
+    // Residual
+    for(var ii=0u;ii<EPT;ii++){
+      let i=my_start+ii;
+      if(i<D){residual[ii]+=io[D+i];}
+    }
+
+    // Reload residual into cache for LN2
+    for(var ii=0u;ii<EPT;ii++){
+      let i=my_start+ii;
+      if(i<D){input_cache[i]=residual[ii];}
+    }
+    workgroupBarrier();
+
+    // === LN2 ===
+    ps=0.0;for(var i=tid;i<D;i+=WG){ps+=input_cache[i];}
+    let mu2=full_reduce(tid,ps)/f32(D);
+    pv=0.0;for(var i=tid;i<D;i+=WG){let d=input_cache[i]-mu2;pv+=d*d;}
+    let is2=min(1.0/sqrt(full_reduce(tid,pv)/f32(D)+EPS),1e4);
+    for(var i=tid;i<D;i+=WG){
+      io[i]=(input_cache[i]-mu2)*is2*LN[LB+${lg2}u+i]+LN[LB+${lb2}u+i];
+    }
+    workgroupBarrier();
+    // Load LN2 output into cache for FFN
+    for(var i=tid;i<D;i+=WG){input_cache[i]=io[i];}
+    workgroupBarrier();
+
+    // === Tiled FFN ===
+    // Zero accumulator
+    for(var ii=0u;ii<EPT;ii++){
+      let i=my_start+ii;
+      if(i<D){io[D+i]=0.0;}
+    }
+    workgroupBarrier();
+
+    for(var tile=0u;tile<DF;tile+=TILE){
+      // FFN up: each thread computes TILE/WG elements of hidden
+      for(var i=tid;i<TILE;i+=WG){
+        let gi=tile+i;
+        if(gi<DF){
+          var a=LN[LB+${b1}u+gi];
+          // 4x unrolled
+          var acc0:f32=0.0;var acc1:f32=0.0;var acc2:f32=0.0;var acc3:f32=0.0;
+          var j=0u;
+          for(;j+3u<D;j+=4u){
+            acc0+=input_cache[j]*W[WB+${w1Off}u+j*DF+gi];
+            acc1+=input_cache[j+1u]*W[WB+${w1Off}u+(j+1u)*DF+gi];
+            acc2+=input_cache[j+2u]*W[WB+${w1Off}u+(j+2u)*DF+gi];
+            acc3+=input_cache[j+3u]*W[WB+${w1Off}u+(j+3u)*DF+gi];
+          }
+          for(;j<D;j++){acc0+=input_cache[j]*W[WB+${w1Off}u+j*DF+gi];}
+          ft[i]=gelu(a+acc0+acc1+acc2+acc3);
+        }else{ft[i]=0.0;}
+      }workgroupBarrier();
+
+      // FFN down: accumulate
+      for(var ii=0u;ii<EPT;ii++){
+        let i=my_start+ii;
+        if(i<D){
+          var a:f32=0.0;
+          for(var j=0u;j<TILE;j++){
+            let gj=tile+j;
+            if(gj<DF){a+=ft[j]*W[WB+${w2Off}u+gj*D+i];}
+          }
+          io[D+i]+=a;
+        }
+      }workgroupBarrier();
+    }
+
+    // Add FFN output + bias to residual
+    for(var ii=0u;ii<EPT;ii++){
+      let i=my_start+ii;
+      if(i<D){residual[ii]+=io[D+i]+LN[LB+${b2}u+i];}
+    }
+
+    // Reload for next layer
+    for(var ii=0u;ii<EPT;ii++){
+      let i=my_start+ii;
+      if(i<D){input_cache[i]=residual[ii];}
+    }
+    workgroupBarrier();
+  }
+
+  // Write output
+  for(var ii=0u;ii<EPT;ii++){
+    let i=my_start+ii;
+    if(i<D){io[i]=residual[ii];}
+  }
+}
+`;
+}
+
+async function run() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const hasSubgroups = adapter.features.has('subgroups');
+  const features = [];
+  if (hasSubgroups) features.push('subgroups');
+  const device = await adapter.requestDevice({
+    requiredFeatures: features,
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    }
+  });
+  L(`GPU: ${(adapter.info||{}).vendor} ${(adapter.info||{}).architecture}`);
+  L(`Subgroups: ${hasSubgroups}\n`);
+
+  const dqPipe = device.createComputePipeline({ layout:'auto', compute:{ module:device.createShaderModule({code:genDequantShader()}), entryPoint:'main' }});
+  const xavierScale = 1.0 / (Math.sqrt(D) * 4.6);
+
+  const tests = [
+    { NL:1, WG:256, sg:false, label:'1L WG=256 no-subgroups (baseline)' },
+    { NL:1, WG:256, sg:hasSubgroups, label:'1L WG=256 +subgroups +tiled matvec' },
+    { NL:8, WG:256, sg:hasSubgroups, label:'8L WG=256 +subgroups +tiled matvec' },
+  ];
+
+  for (const test of tests) {
+    const { NL, WG, sg, label } = test;
+    // Shared: input_cache(D) + ft(256) + sr(WG or 0)
+    const sharedBytes = (D + 256 + (sg ? 0 : WG)) * 4;
+    L(`--- ${label} ---`);
+    L(`  Shared: ${(sharedBytes/1024).toFixed(1)}KB`);
+    if (sharedBytes > 16000) { L(`  SKIP: too much shared\n`); continue; }
+
+    const code = genTiledComputeShader(NL, WG, sg);
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errors = info.messages.filter(m => m.type === 'error');
+    if (errors.length > 0) { L(`  ERROR: ${errors[0].message}\n`); continue; }
+    const pipe = device.createComputePipeline({ layout:'auto', compute:{ module:mod, entryPoint:'main' }});
+    L(`  Compiled OK`);
+
+    // Buffers + dequant
+    const dqSize = projParams * NL;
+    if (dqSize * 4 > adapter.limits.maxStorageBufferBindingSize) { L(`  SKIP: weights too large\n`); continue; }
+
+    const dqBuf = device.createBuffer({ size: dqSize*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const lnBuf = device.createBuffer({ size: lnParams*NL*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const ioBuf = device.createBuffer({ size: D*2*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const kvBuf = device.createBuffer({ size: NL*D*2*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+    for (let l = 0; l < NL; l++) {
+      const pBuf=device.createBuffer({size:packedU32s*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+      const sBuf=device.createBuffer({size:nGroups*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+      const CHUNK=1024*1024;
+      for(let off=0;off<packedU32s;off+=CHUNK){const end=Math.min(off+CHUNK,packedU32s);const sl=new Uint32Array(end-off);for(let i=0;i<sl.length;i++){let v=0;for(let b=0;b<8;b++)v|=(Math.floor(Math.random()*16)<<(b*4));sl[i]=v;}device.queue.writeBuffer(pBuf,off*4,sl);}
+      const sc=new Float32Array(nGroups);for(let i=0;i<sc.length;i++)sc[i]=xavierScale*(Math.random()*0.3+0.85);
+      device.queue.writeBuffer(sBuf,0,new Uint32Array(sc.buffer));
+      const ln=new Float32Array(lnParams);for(let i=0;i<D;i++){ln[i]=1;ln[2*D+i]=1;}
+      device.queue.writeBuffer(lnBuf,l*lnParams*4,new Uint32Array(ln.buffer));
+      const bg=device.createBindGroup({layout:dqPipe.getBindGroupLayout(0),entries:[
+        {binding:0,resource:{buffer:pBuf}},{binding:1,resource:{buffer:sBuf}},
+        {binding:2,resource:{buffer:dqBuf,offset:l*projParams*4,size:projParams*4}},
+      ]});
+      const enc=device.createCommandEncoder();const pass=enc.beginComputePass();
+      pass.setPipeline(dqPipe);pass.setBindGroup(0,bg);pass.dispatchWorkgroups(Math.ceil(projParams/256));
+      pass.end();device.queue.submit([enc.finish()]);pBuf.destroy();sBuf.destroy();
+    }
+    await device.queue.onSubmittedWorkDone();
+
+    const emb=new Float32Array(D);for(let i=0;i<D;i++)emb[i]=(Math.random()-0.5)*0.1;
+
+    async function runInf(){
+      device.queue.writeBuffer(ioBuf,0,emb);
+      device.queue.writeBuffer(uBuf,0,new Uint32Array([0,0,0,0]));
+      const bg=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[
+        {binding:0,resource:{buffer:dqBuf}},{binding:1,resource:{buffer:lnBuf}},
+        {binding:2,resource:{buffer:ioBuf}},{binding:3,resource:{buffer:kvBuf}},
+        {binding:4,resource:{buffer:uBuf}},
+      ]});
+      const enc=device.createCommandEncoder();const pass=enc.beginComputePass();
+      pass.setPipeline(pipe);pass.setBindGroup(0,bg);pass.dispatchWorkgroups(1);
+      pass.end();device.queue.submit([enc.finish()]);await device.queue.onSubmittedWorkDone();
+    }
+
+    // Validate
+    await runInf();
+    const readBuf=device.createBuffer({size:D*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+    const rEnc=device.createCommandEncoder();rEnc.copyBufferToBuffer(ioBuf,0,readBuf,0,D*4);
+    device.queue.submit([rEnc.finish()]);await device.queue.onSubmittedWorkDone();
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const check=new Float32Array(readBuf.getMappedRange().slice(0));readBuf.unmap();
+    if(check.every(v=>v===0)){L(`  FAIL: zeros\n`);continue;}
+    if(check.some(v=>isNaN(v))){L(`  FAIL: NaN\n`);continue;}
+    L(`  OK [${check[0].toFixed(4)}, ${check[1].toFixed(4)}]`);
+
+    // Benchmark
+    for(let i=0;i<5;i++)await runInf();
+    const times=[];
+    for(let i=0;i<10;i++){const t0=performance.now();await runInf();times.push(performance.now()-t0);}
+    const mean=times.reduce((a,b)=>a+b)/times.length;
+    const prev1L = 30; // baseline pre-dequant
+    L(`  ${mean.toFixed(1)} ms/token | ${(1000/mean).toFixed(1)} tok/s | ${(prev1L/mean).toFixed(1)}x vs baseline\n`);
+
+    dqBuf.destroy();lnBuf.destroy();ioBuf.destroy();kvBuf.destroy();uBuf.destroy();readBuf.destroy();
+  }
+
+  L('Done. Baseline (pre-dequant, no tiling): 1L=30ms, 8L=227ms');
+}
+run().catch(e=>L(`FATAL: ${e.message}\n${e.stack}`));
+</script>
+</body></html>
