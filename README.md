@@ -1,5 +1,10 @@
 # webgpu-fusion-max
 
+[![CI](https://github.com/abgnydn/webgpu-fusion-max/actions/workflows/ci.yml/badge.svg)](https://github.com/abgnydn/webgpu-fusion-max/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Speedup](https://img.shields.io/badge/decode%20speedup-11×-ffb56e)](#the-result)
+[![Sister: zero-tvm](https://img.shields.io/badge/sister-zero--tvm-orange)](https://github.com/abgnydn/zero-tvm)
+
 **Pushing single-dispatch transformer fusion to a real model: Phi-3-mini (3.6B params, D=3072) running in Chrome via tiled WebGPU compute shaders.**
 
 This is the "how far does it scale?" companion to [`webgpu-transformer-fusion`](https://github.com/abgnydn/webgpu-transformer-fusion) (the paper, which proved the technique on toy models D=32–256) and [`zero-tvm`](https://github.com/abgnydn/zero-tvm) (the production-shaped 10-kernel design at the same model size).
